@@ -93,6 +93,14 @@
   #secret h3 { margin: 0 0 6px; font-size: 15px; }
   #secret code { display: block; font-family: var(--mono); background: var(--chip); padding: 8px; border-radius: 6px; margin: 10px 0; overflow-wrap: anywhere; user-select: all; }
   #secret .btns { display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* MCP 接入弹窗 */
+  #mcp { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 9; }
+  #mcp .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; max-width: 560px; width: 100%; }
+  #mcp h3 { margin: 0 0 6px; font-size: 15px; }
+  #mcp label { display: block; font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  #mcp code, #mcp pre { display: block; font-family: var(--mono); background: var(--chip); padding: 8px; border-radius: 6px; margin-top: 4px; overflow-wrap: anywhere; white-space: pre-wrap; user-select: all; }
+  #mcp .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -102,6 +110,7 @@
     <h1>mc-agent 控制台</h1>
     <span class="muted mono" id="server-addr"></span>
     <span class="spacer"></span>
+    <button id="mcp-btn" title="MCP 客户端接入配置">MCP 接入</button>
     <span id="conn-dot" title="与服务的连接状态"></span>
   </header>
   <main>
@@ -138,6 +147,18 @@
     <div class="muted" id="secret-desc"></div>
     <code id="secret-value"></code>
     <div class="btns"><button id="secret-copy">复制</button><button class="primary" id="secret-close">关闭</button></div>
+  </div>
+</div>
+
+<div id="mcp" class="hidden" role="dialog" aria-modal="true">
+  <div class="box">
+    <h3>MCP 接入配置</h3>
+    <div class="muted">LLM 客户端按以下配置连接; 请求头 x-token 携带角色 token (见各角色卡片的「查看」)。地址随当前访问方式生成。</div>
+    <label>接入地址 (StreamableHTTP)</label>
+    <code id="mcp-url"></code>
+    <label>客户端配置示例 (JSON)</label>
+    <pre id="mcp-config"></pre>
+    <div class="btns"><button id="mcp-copy-url">复制地址</button><button id="mcp-copy-config">复制配置</button><button class="primary" id="mcp-close">关闭</button></div>
   </div>
 </div>
 
@@ -202,6 +223,21 @@ function showSecret (title, desc, value) {
   $('secret-close').focus()
 }
 $('secret-close').onclick = () => $('secret').classList.add('hidden')
+
+// MCP 接入弹窗: 地址按当前访问方式生成 (127.0.0.1 或局域网 IP 都能得到可用配置)
+function openMcp () {
+  const url = location.origin + '/mcp'
+  const first = agents[0]
+  const tok = first ? `<${first.name} 的 token>` : '<角色 token>'
+  $('mcp-url').textContent = url
+  $('mcp-config').textContent = JSON.stringify({ type: 'http', url, headers: { 'x-token': tok } }, null, 2)
+  $('mcp').classList.remove('hidden')
+  $('mcp-close').focus()
+}
+$('mcp-btn').onclick = openMcp
+$('mcp-close').onclick = () => $('mcp').classList.add('hidden')
+$('mcp-copy-url').onclick = () => copy($('mcp-url').textContent)
+$('mcp-copy-config').onclick = () => copy($('mcp-config').textContent)
 
 const fmtTime = (ms) => new Date(ms).toLocaleTimeString('zh-CN', { hour12: false })
 function ago (ms) {
