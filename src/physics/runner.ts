@@ -70,6 +70,9 @@ export class PhysicsRunner {
     }
   }
 
+  /** 是否在水中 (上一 tick 物理结果) */
+  get inWater (): boolean { return !!this.botLike.entity.isInWater }
+
   syncFromBot () {
     this.botLike.entity.position.set(this.bot.pos.x, this.bot.pos.y, this.bot.pos.z)
     this.velocity.set(0, 0, 0)
@@ -81,8 +84,9 @@ export class PhysicsRunner {
     if (Math.abs(p.x - this.bot.pos.x) > 2 || Math.abs(p.y - this.bot.pos.y) > 2 || Math.abs(p.z - this.bot.pos.z) > 2) {
       this.syncFromBot()
     }
-    this.botLike.entity.yaw = this.bot.yaw
-    this.botLike.entity.pitch = this.bot.pitch
+    // prismarine-physics 用 mineflayer 约定 (弧度, yaw = π - notchYaw, pitch = -notchPitch), bot 内部是原版角度制
+    this.botLike.entity.yaw = Math.PI - this.bot.yaw * Math.PI / 180
+    this.botLike.entity.pitch = -this.bot.pitch * Math.PI / 180
     try {
       const state = new PlayerState(this.botLike, this.control)
       this.physics.simulatePlayer(state, this.pworld)

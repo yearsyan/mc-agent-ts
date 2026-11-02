@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mc-agent 控制台</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8; --panel: #ffffff; --line: #e3e6eb; --text: #1d2228; --muted: #6b7380;
+    --accent: #2f6fde; --ok: #1f9d55; --warn: #c27c0e; --err: #d33a3a; --chip: #eef1f5;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171b; --panel: #1c2026; --line: #2c323a; --text: #e4e7eb; --muted: #8b94a0;
+      --accent: #5b93f0; --ok: #3cc47c; --warn: #e0a43a; --err: #f06262; --chip: #262b33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  button, input, select { font: inherit; color: inherit; }
+  button { background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--err); }
+  select { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+  input[type=text], input[type=password] { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; min-width: 0; }
+  input:focus, button:focus-visible, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hidden { display: none !important; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+
+  /* 主体 */
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+  header button { white-space: nowrap; }
+  @media (max-width: 520px) { #server-addr { display: none; } }
+  header .spacer { flex: 1; }
+  #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  #conn-dot.ok { background: var(--ok); }
+  #conn-dot.bad { background: var(--err); }
+  main { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 16px; padding: 16px; align-items: start; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .panel-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .panel-head h2 { font-size: 14px; margin: 0; }
+
+  /* 角色卡 */
+  #agents { padding: 6px; }
+  .agent { border: 1px solid transparent; border-radius: 8px; padding: 10px; cursor: pointer; }
+  .agent + .agent { margin-top: 4px; }
+  .agent:hover { background: var(--chip); }
+  .agent.selected { border-color: var(--accent); background: var(--chip); }
+  .agent .row1 { display: flex; align-items: center; gap: 8px; }
+  .agent .name { font-weight: 600; }
+  .pill { font-size: 12px; padding: 0 8px; border-radius: 10px; background: var(--chip); color: var(--muted); border: 1px solid var(--line); }
+  .pill.online { color: var(--ok); border-color: currentColor; }
+  .pill.connecting { color: var(--warn); border-color: currentColor; }
+  .pill.disabled { color: var(--err); border-color: currentColor; }
+  .agent .meta { font-size: 12.5px; color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }
+  .agent .btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .agent .btns button { font-size: 12.5px; padding: 2px 8px; }
+  .token-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 12.5px; flex-wrap: wrap; }
+  .token-row code { font-family: var(--mono); background: var(--chip); padding: 1px 6px; border-radius: 4px; overflow-wrap: anywhere; }
+  #add-form { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); }
+  #add-form input { flex: 1; }
+
+  /* 日志 */
+  #log-filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; font-size: 13px; }
+  #log-filters label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+  #logs { height: calc(100vh - 170px); min-height: 320px; overflow-y: auto; padding: 4px 0; font-size: 13px; }
+  @media (max-width: 860px) { #logs { height: 60vh; } }
+  .log { display: grid; grid-template-columns: 64px 76px 44px 1fr; gap: 8px; padding: 3px 14px; align-items: baseline; }
+  .log:hover { background: var(--chip); }
+  .log .t { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .log .a { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log .k { font-size: 11.5px; text-align: center; border-radius: 4px; background: var(--chip); color: var(--muted); }
+  .log .x { overflow-wrap: anywhere; white-space: pre-wrap; }
+  .log .ms { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .log.warn .x { color: var(--warn); }
+  .log.error .x { color: var(--err); }
+  .log.k-query { opacity: .7; }
+  .k.tool { color: var(--accent); } .k.reflex { color: #9b59d0; } .k.action { color: var(--ok); } .k.conn { color: var(--warn); } .k.admin { color: var(--err); }
+  @media (max-width: 520px) { .log { grid-template-columns: 56px 1fr; } .log .a, .log .k { display: none; } }
+  #logs-empty { padding: 30px; text-align: center; }
+
+  /* 提示条 */
+  #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; max-width: calc(100% - 32px); box-shadow: 0 4px 16px rgba(0,0,0,.2); z-index: 10; overflow-wrap: anywhere; }
+  #secret { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 9; }
+  #secret .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; max-width: 480px; width: 100%; }
+  #secret h3 { margin: 0 0 6px; font-size: 15px; }
+  #secret code { display: block; font-family: var(--mono); background: var(--chip); padding: 8px; border-radius: 6px; margin: 10px 0; overflow-wrap: anywhere; user-select: all; }
+  #secret .btns { display: flex; gap: 8px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <header>
+    <h1>mc-agent 控制台</h1>
+    <span class="muted mono" id="server-addr"></span>
+    <span class="spacer"></span>
+    <span id="conn-dot" title="与服务的连接状态"></span>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="panel-head"><h2>角色</h2><span class="muted" id="agent-count"></span></div>
+      <div id="agents"></div>
+      <form id="add-form">
+        <input id="add-name" type="text" placeholder="新角色名 (3-16 位字母数字下划线)" pattern="[A-Za-z0-9_]{3,16}" required>
+        <button type="submit">添加</button>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>操作日志</h2>
+        <select id="log-agent" aria-label="按角色筛选"><option value="">全部角色</option></select>
+        <div id="log-filters">
+          <label><input type="checkbox" value="tool" checked>操作</label>
+          <label><input type="checkbox" value="action" checked>动作结果</label>
+          <label><input type="checkbox" value="reflex" checked>反射</label>
+          <label><input type="checkbox" value="conn" checked>连接</label>
+          <label><input type="checkbox" value="admin" checked>管理</label>
+          <label><input type="checkbox" value="query">查询</label>
+          <label title="新日志到达时滚到底部"><input type="checkbox" id="follow" checked>跟随</label>
+        </div>
+      </div>
+      <div id="logs"><div id="logs-empty" class="muted">暂无日志</div></div>
+    </section>
+  </main>
+</div>
+
+<div id="secret" class="hidden" role="dialog" aria-modal="true">
+  <div class="box">
+    <h3 id="secret-title"></h3>
+    <div class="muted" id="secret-desc"></div>
+    <code id="secret-value"></code>
+    <div class="btns"><button id="secret-copy">复制</button><button class="primary" id="secret-close">关闭</button></div>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script>
+'use strict'
+const $ = (id) => document.getElementById(id)
+const KIND_LABEL = { tool: '操作', query: '查询', action: '动作', conn: '连接', admin: '管理', reflex: '反射' }
+const STATUS_LABEL = { online: '在线', connecting: '连接中', offline: '离线' }
+const ACTION_LABEL = { running: '进行中', done: '完成', failed: '失败', cancelled: '取消' }
+
+let agents = []
+let selected = ''         // 日志筛选的角色 ('' = 全部)
+let lastSeq = 0
+let busy = new Set()      // 正在执行操作的角色, 防重复点击
+let agentTimer = null, logTimer = null
+
+// ---------- 通用 ----------
+
+async function api (method, path, body) {
+  const res = await fetch('/webui-api' + path, {
+    method,
+    ...(body ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status))
+  return data
+}
+
+function el (tag, attrs = {}, ...children) {
+  const e = document.createElement(tag)
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v)
+    else if (v === true) e.setAttribute(k, '')
+    else if (v !== false && v != null) e.setAttribute(k, v)
+  }
+  for (const c of children) if (c != null) e.append(c)  // 字符串经 append 作为文本节点插入 (自动转义)
+  return e
+}
+
+let toastTimer = null
+function toast (msg) {
+  const t = $('toast')
+  t.textContent = msg
+  t.classList.remove('hidden')
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => t.classList.add('hidden'), 3200)
+}
+
+async function copy (text) {
+  try { await navigator.clipboard.writeText(text); toast('已复制') } catch { toast('复制失败, 请手动选中复制') }
+}
+
+function showSecret (title, desc, value) {
+  $('secret-title').textContent = title
+  $('secret-desc').textContent = desc
+  $('secret-value').textContent = value
+  $('secret').classList.remove('hidden')
+  $('secret-copy').onclick = () => copy(value)
+  $('secret-close').focus()
+}
+$('secret-close').onclick = () => $('secret').classList.add('hidden')
+
+const fmtTime = (ms) => new Date(ms).toLocaleTimeString('zh-CN', { hour12: false })
+function ago (ms) {
+  if (!ms) return '无记录'
+  const s = Math.round((Date.now() - ms) / 1000)
+  if (s < 60) return s + ' 秒前'
+  if (s < 3600) return Math.round(s / 60) + ' 分钟前'
+  return Math.round(s / 3600) + ' 小时前'
+}
+
+// ---------- 刷新循环 ----------
+
+function start () {
+  refreshAgents()
+  resetLogs()
+  clearInterval(agentTimer); clearInterval(logTimer)
+  agentTimer = setInterval(refreshAgents, 2000)
+  logTimer = setInterval(pollLogs, 1500)
+}
+
+// ---------- 角色 ----------
+
+async function refreshAgents () {
+  try {
+    const data = await api('GET', '/agents')
+    agents = data.agents
+    $('server-addr').textContent = 'MC 服务器 ' + data.server
+    $('conn-dot').className = 'ok'
+    renderAgents()
+  } catch {
+    $('conn-dot').className = 'bad'
+  }
+}
+
+function renderAgents () {
+  const box = $('agents')
+  box.replaceChildren(...agents.map(agentCard))
+  const online = agents.filter(a => a.status === 'online').length
+  $('agent-count').textContent = `${online} / ${agents.length} 在线`
+  // 同步日志筛选下拉
+  const sel = $('log-agent')
+  const want = ['', ...agents.map(a => a.name)]
+  const have = [...sel.options].map(o => o.value)
+  if (want.join('|') !== have.join('|')) {
+    sel.replaceChildren(...want.map(n => el('option', { value: n }, n || '全部角色')))
+    sel.value = want.includes(selected) ? selected : ''
+  }
+}
+
+function agentCard (a) {
+  const isBusy = busy.has(a.name)
+  const pill = a.disabled
+    ? el('span', { class: 'pill disabled' }, '已禁用' + (a.status === 'offline' ? '' : ' · ' + STATUS_LABEL[a.status]))
+    : el('span', { class: 'pill ' + a.status }, STATUS_LABEL[a.status])
+  const meta = []
+  if (a.position) meta.push(`(${a.position.x}, ${a.position.y}, ${a.position.z})`, `血量 ${a.health}`, `饱食 ${a.food}`)
+  if (a.action) meta.push(`动作 #${a.action.id} ${a.action.type} ${ACTION_LABEL[a.action.status] || a.action.status}`)
+  meta.push('最近活动 ' + ago(a.lastLogAt))
+
+  const stop = (fn) => (e) => { e.stopPropagation(); fn() }
+  const online = a.status !== 'offline'
+  return el('div', {
+    class: 'agent' + (selected === a.name ? ' selected' : ''),
+    onclick: () => selectAgent(selected === a.name ? '' : a.name),
+    title: '点击筛选该角色的日志',
+  },
+    el('div', { class: 'row1' }, el('span', { class: 'name' }, a.name), pill),
+    el('div', { class: 'meta' }, meta.join(' · ')),
+    el('div', { class: 'token-row' },
+      el('span', { class: 'muted' }, 'token'), el('code', {}, a.token),
+      el('button', { onclick: stop(() => revealToken(a.name)) }, '查看'),
+      el('button', { onclick: stop(() => rotateToken(a.name)), disabled: isBusy }, '轮换'),
+    ),
+    el('div', { class: 'btns' },
+      online
+        ? el('button', { onclick: stop(() => doOp(a.name, 'POST', '/offline', null, '已退出世界')), disabled: isBusy }, '退出世界')
+        : el('button', { onclick: stop(() => doOp(a.name, 'POST', '/online', null, '已上线')), disabled: isBusy || a.disabled }, '上线'),
+      el('button', { onclick: stop(() => toggleDisabled(a)), disabled: isBusy }, a.disabled ? '允许上线' : '禁止上线'),
+      el('button', { class: 'danger', onclick: stop(() => removeAgent(a.name)), disabled: isBusy }, '删除'),
+    ),
+  )
+}
+
+async function doOp (name, method, sub, body, okMsg) {
+  busy.add(name); renderAgents()
+  try {
+    await api(method, '/agents/' + encodeURIComponent(name) + sub, body)
+    toast(`${name}: ${okMsg}`)
+  } catch (err) {
+    toast(`${name}: ${err.message}`)
+  } finally {
+    busy.delete(name)
+    await refreshAgents()
+    pollLogs()
+  }
+}
+
+function toggleDisabled (a) {
+  if (!a.disabled && !confirm(`禁止 ${a.name} 上线?\n\n会立即退出世界, 且它的 agent token 不再自动重连, 直到你点"允许上线"。`)) return
+  doOp(a.name, 'POST', '/disabled', { disabled: !a.disabled }, a.disabled ? '已允许上线' : '已禁止上线')
+}
+
+async function revealToken (name) {
+  try {
+    const { token: t } = await api('GET', '/agents/' + encodeURIComponent(name) + '/token')
+    showSecret(`${name} 的 token`, 'MCP 客户端用请求头 x-token 携带此 token, 即以该角色身份操作。', t)
+  } catch (err) { toast(err.message) }
+}
+
+async function rotateToken (name) {
+  if (!confirm(`轮换 ${name} 的 token?\n\n旧 token 立即失效, 使用它的 MCP 客户端需要换成新 token。角色当前若在线不会被踢下线。`)) return
+  try {
+    const { token: t } = await api('POST', '/agents/' + encodeURIComponent(name) + '/token/rotate')
+    showSecret(`${name} 的新 token`, '旧 token 已失效。请更新 MCP 客户端配置。', t)
+    refreshAgents(); pollLogs()
+  } catch (err) { toast(err.message) }
+}
+
+async function removeAgent (name) {
+  if (!confirm(`删除角色 ${name}?\n\n会立即退出世界, token 作废。(游戏存档和服务器白名单不受影响)`)) return
+  await doOp(name, 'DELETE', '', null, '已删除')
+  if (selected === name) selectAgent('')
+}
+
+$('add-form').addEventListener('submit', async (e) => {
+  e.preventDefault()
+  const name = $('add-name').value.trim()
+  try {
+    const { token: t } = await api('POST', '/agents', { name })
+    $('add-name').value = ''
+    showSecret(`已创建 ${name}`, '这是它的 token。别忘了把该名字加进 MC 服务器白名单 (whitelist add ' + name + ')。', t)
+    refreshAgents(); pollLogs()
+  } catch (err) { toast(err.message) }
+})
+
+// ---------- 日志 ----------
+
+function kinds () {
+  return [...document.querySelectorAll('#log-filters input[value]')].filter(i => i.checked).map(i => i.value)
+}
+
+function selectAgent (name) {
+  selected = name
+  $('log-agent').value = name
+  renderAgents()
+  resetLogs()
+}
+$('log-agent').addEventListener('change', (e) => selectAgent(e.target.value))
+document.querySelectorAll('#log-filters input[value]').forEach(i => i.addEventListener('change', resetLogs))
+
+function resetLogs () {
+  lastSeq = 0
+  $('logs').replaceChildren(el('div', { id: 'logs-empty', class: 'muted' }, '加载中…'))
+  pollLogs(true)
+}
+
+let polling = false
+async function pollLogs (initial) {
+  if (polling) return
+  polling = true
+  try {
+    const k = kinds()
+    const q = new URLSearchParams({ since: String(lastSeq), limit: initial ? '500' : '300', kinds: k.join(',') || 'none' })
+    if (selected) q.set('agent', selected)
+    const data = await api('GET', '/logs?' + q)
+    if (data.lastSeq < lastSeq) { polling = false; return resetLogs() } // 服务重启过, seq 重新编号
+    lastSeq = data.lastSeq
+    appendLogs(data.entries, initial)
+  } catch {} finally { polling = false }
+}
+
+function appendLogs (entries, initial) {
+  const box = $('logs')
+  const empty = $('logs-empty')
+  if (!entries.length) {
+    if (initial && empty) empty.textContent = '暂无日志'
+    return
+  }
+  if (empty) empty.remove()
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40
+  const frag = document.createDocumentFragment()
+  for (const e of entries) {
+    const ms = e.data && typeof e.data.ms === 'number' && e.data.ms >= 50 ? el('span', { class: 'ms' }, (e.data.ms / 1000).toFixed(1) + 's') : null
+    const via = e.data && e.data.by === 'admin' ? el('span', { class: 'ms' }, '[admin]') : null
+    frag.append(el('div', { class: `log ${e.level} k-${e.kind}`, title: new Date(e.at).toLocaleString('zh-CN') },
+      el('span', { class: 't' }, fmtTime(e.at)),
+      el('span', { class: 'a' }, e.agent),
+      el('span', { class: 'k ' + e.kind }, KIND_LABEL[e.kind] || e.kind),
+      el('span', { class: 'x' }, e.text, via, ms),
+    ))
+  }
+  box.append(frag)
+  while (box.children.length > 2000) box.firstChild.remove()
+  if ($('follow').checked && (initial || atBottom)) box.scrollTop = box.scrollHeight
+}
+
+// ---------- 启动 ----------
+start()
+</script>
+</body>
+</html>

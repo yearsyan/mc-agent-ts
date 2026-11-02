@@ -11,9 +11,10 @@
 ## 架构
 
 ```
-单一 Node 服务 (127.0.0.1:8767, npm run bot)
+单一 Node 服务 (默认 127.0.0.1:8767, API_HOST=0.0.0.0 可对外, npm run bot)
 ├─ POST /mcp        MCP StreamableHTTP (无状态) ← LLM 客户端直连
-├─ /webui-api/*     手动运维 (admin token): POST /webui-api/agents/<名>/offline
+├─ GET  /webui      WebUI 控制台 (无鉴权): 操作日志 / 角色与 token 管理 / 退出世界
+├─ /webui-api/*     WebUI 后端 (无鉴权)
 ├─ REST 调试路由     curl 直接测
 └─ 每 agent 一条 MC 协议连接 (原生 protocol 777)
    ├─ Fabric 握手伪装 + tick 门控
@@ -21,8 +22,10 @@
    └─ 视觉: DDA raycast PNG (实体叠加) + 场景 JSON
 
 token 即角色 (~/.mc-agent/tokens.json):
-  admin   → 管全部角色 (工具需传 name)
-  Agent_A / Agent_B / agent_c → MCP 调用自动绑定该角色, 掉线自动重连
+  admin   → 管全部角色 (16 个工具; 工具需传 name)
+  <角色名> → MCP 调用自动绑定该角色, 掉线自动重连 (被禁止上线时除外)
+            tools/list 按角色过滤: 不见 spawn_agent, 不需 name 参数
+  角色列表 = tokens.json 的 agents 键 (默认 Agent_A / Agent_B / agent_c), 可在 WebUI 增删
 ```
 
 ## 快速开始
@@ -31,7 +34,8 @@ token 即角色 (~/.mc-agent/tokens.json):
 npm install                                   # 装依赖
 python3 scripts/apply_nmp_patch.py third_party/patches/nmp-entityDelta.diff node_modules/minecraft-protocol
 npx tsx scripts/setup-overlay.ts              # 打 26.3 数据 overlay (node_modules 内)
-npx tsx src/http/serve.ts                     # 启动单一服务 (MCP + REST + webui-api)
+npx tsx src/http/serve.ts                     # 启动单一服务 (MCP + REST + WebUI)
+# 浏览器打开 http://127.0.0.1:8767/webui (无鉴权; API_HOST=0.0.0.0 时对局域网开放, 自行确保网络可信)
 # tokens 在 ~/.mc-agent/tokens.json (admin + 每角色一个)
 python3 scripts/mcp_call.py <Agent_A|admin> tools/call '{"name":"get_scene","arguments":{}}'
 ```
@@ -43,13 +47,51 @@ python3 scripts/mcp_call.py <Agent_A|admin> tools/call '{"name":"get_scene","arg
 | 工具 | 说明 |
 |---|---|
 | `spawn_agent(name)` / `kill_agent` / `list_agents` | agent 生命周期 |
-| `get_scene(name)` | 位置/朝向/血量/脚下方块/准星指向/附近实体(类型/方位/距离) |
+| `get_scene(name)` | 位置/朝向/血量/饱食/手持/时间(昼夜)/背包汇总/脚下方块/准星指向/附近实体(类型/掉落物内容/敌对标记/方位/距离)/反射层状态 |
 | `get_view(name, w, h, fov)` | 第一人称 raycast 合成 PNG |
 | `get_map(name, r, s)` | 顶视地图 PNG（红点=self，红/蓝点=敌对/被动实体） |
 | `read_chat(name, since)` / `say(name, text)` | 聊天收发 |
-| `act(name, type, ...)` | move_to{x,z} / dig{x,y,z} / place / attack{entity_id} / jump / stop（异步） |
-| `wait_action(name, actionId?, timeoutMs)` | 等动作完成 |
+| `act(name, type, ...)` | 异步动作, 见下表 |
+| `set_policy(name, ...)` | 反射策略 (bot 自主执行, 见下) |
+| `wait_action(name, actionId?, timeoutMs)` | 等动作完成 (不带 id = 最近一个) |
 | `get_block(name, x, y, z)` | 方块查询 |
+
+### act 动作
+
+| 类别 | 动作 |
+|---|---|
+| 移动 | `move_to{x,z,y?,tolerance?}` 自动开门/爬梯子藤蔓/游泳/垫方块上升/搭桥/挖穿/挖下, 远距离按 64 格分段 · `go_home` · `jump` · `stop` |
+| 采集 | `collect{block,count?,radius?}` 找→走过去(够不着就垫高, 埋着就挖进去)→用最佳工具挖→捡掉落 · `dig{x,y,z}` (自动换工具; 旁边有岩浆拒绝) · `pickup_items{radius?}` |
+| 建造 | `place{x,y,z,item?\|hotbar?,face?}` |
+| 合成 | `craft{item,count?}` 任意配方 (3×3 自动找/放工作台; 材料不足时列出缺什么) · `smelt{item,count?,fuel?}` 自动找/放熔炉、选燃料 |
+| 物品 | `equip{item}` 工具→手, 盔甲→身上, 盾→副手 · `eat{item?}` · `use_item{item?,hold_ms?}` · `select_slot` · `drop_item` |
+| 交互 | `use_block{x,y,z,item?}` 门/拉杆/按钮… · `sleep{x?,y?,z?}` / `wake` · `interact_entity{entity_id,item?}` 喂食繁殖/剪毛/骑乘 · `mount` / `dismount` · `trade{entity_id,index?,times?}` (不给 index 返回交易列表) |
+| 战斗 | `attack{entity_id,hits?}` 自动换最好的武器 |
+| 容器 | `open_container` · `chest_take{slot}` · `chest_put{slot}` · `close_window` |
+
+### 反射层 (`src/conn/reflex.ts`)
+
+LLM 决策一次要数秒, 僵尸几秒就能打死人, 所以保命行为由 bot 每 tick 自主执行, LLM 只设策略 (`set_policy`, 持久化在 `~/.mc-agent/policies.json`, 重连沿用):
+
+| 策略 | 默认 | 行为 |
+|---|---|---|
+| `autoEat` / `eatAt` | true / 14 | 饱食 ≤ eatAt (或掉血且 ≤17) 时挑最好的食物吃, 不打断当前动作 |
+| `combat` / `fleeHealth` | defend / 8 | defend: 敌对生物进入 3.3 格自动换武器还击; 血 ≤ fleeHealth 或遇苦力怕时逃跑。flee: 见怪就跑。ignore |
+| `avoidHazards` | true | 脚下岩浆/火 → 直接接管控制冲向最近的安全格; 氧气不足时上浮; 空闲泡在水里时踩水 |
+| `nightShelter` / `home` | false / null | 天黑且空闲时回家 (`home: "here"` 设当前位置), 家附近有床就睡 |
+
+反射层打断 LLM 的动作时会在该动作的 detail 写明原因 (如 `被反射打断: 迎战 zombie`), 每次介入都进操作日志 (类型 `反射`)。
+
+## WebUI
+
+`http://127.0.0.1:8767/webui`，打开即用（暂无鉴权，服务默认只绑本机；对外监听时请确保网络可信）。
+
+- **操作日志**：每个角色的工具调用 (MCP/REST)、动作结果、上线/下线/掉线/死亡、管理操作；按角色/类型筛选，1.5s 增量刷新。
+  只读查询 (get_scene/get_view/…) 默认隐藏。日志同时写入 `~/.mc-agent/logs/<角色>.jsonl`（>5MB 轮转，保留 `.1`~`.3` 三份旧文件，单角色最多约 20MB），服务重启后恢复最近 500 条/角色。
+- **token 管理**：查看/复制、轮换 (旧 token 立即失效，在线角色不受影响)、新增角色 (名字需另行加入服务器白名单)、删除角色。
+- **退出世界**：「退出世界」只断开连接，该角色 token 的下一次 MCP 调用会自动重连；「禁止上线」则同时阻止自动重连，直到「允许上线」。
+
+tokens.json 新增可选字段 `disabled: [角色名]`；`agents` 仍是 `名 → token` 字符串映射，旧脚本照常可读。
 
 ## 26.3 协议要点（踩坑记录）
 
@@ -57,7 +99,7 @@ python3 scripts/mcp_call.py <Agent_A|admin> tools/call '{"name":"get_scene","arg
 2. **tick 门控**：26.3 服务器同 tick 收到第二个移动包即踢；必须每物理 tick 恰好一对 `position` + `client_tick_end`
 3. **teleport_confirm 回显**：26.3 必须回显 x/y/z/yRot/xRot（仅 teleportId 无效）
 4. **挖掘 Action 枚举移位**：26.3 新增 `CHANGE_DESTROY_DIRECTION` 插在位置 1，STOP_DESTROY 从 2 变成 **3**（发 2 = ABORT，表现为"挖不掉"）
-5. **multi_block_change 新格式**：`chunkCoordinates{x,z=chunk, y=section}` + records[] = `(stateId<<12)|(ly<<8|lz<<4|lx)`
+5. **multi_block_change 新格式**：`chunkCoordinates{x,z=chunk, y=section}` + records[] = `(stateId<<12)|(lx<<8|lz<<4|ly)`（x 在高位、y 在低位）
 6. **chunk_batch_received**：每批区块必须应答否则服务器停发（chunks 卡在 9）
 7. **player_loaded**：26.x 新包，登录后应发送
 
@@ -66,33 +108,42 @@ python3 scripts/mcp_call.py <Agent_A|admin> tools/call '{"name":"get_scene","arg
 - `src/conn/bot.ts` — 连接/握手/tick 循环/动作调度/聊天
 - `src/world/world.ts` — chunk 缓存/方块查询/实体追踪
 - `src/physics/runner.ts` — prismarine-physics 适配（含传送重同步）
-- `src/actions/` — 动作系统 + A* 寻路
+- `src/actions/base.ts` — 动作基类 + AsyncAction (多步异步动作, 子动作/取消传播)
+- `src/actions/actions.ts` — 移动/挖掘/放置/攻击/容器; `tasks.ts` — 合成/熔炼/采集/拾取/装备/进食/交互/交易; `hands.ts` — 换手持/放方块
+- `src/actions/astar.ts` — A* 寻路
+- `src/conn/reflex.ts` — 反射层 (进食/战斗/逃跑/危险地形/夜间回家)
+- `src/game/knowledge.ts` — 物品/方块知识 (工具速度、挖掘时间、食物、燃料、敌对生物)
 - `src/vision/` — raycast 渲染 + 调色板
-- `src/http/serve.ts` — HTTP API
-- `src/mcp/server.ts` — MCP stdio
+- `src/http/serve.ts` — 单一 HTTP 服务 (MCP + REST + webui-api)
+- `src/http/tokens.ts` — token 存储 (tokens.json, 增删/轮换/禁用)
+- `src/http/oplog.ts` — 操作日志 (内存 + `~/.mc-agent/logs/<角色>.jsonl`)
+- `src/http/webui.html` — WebUI 单页
 - `third_party/` — 26.2/26.3 数据文件 (来自 minecraft-data PR #1301 分支, MIT, 见 NOTICE.md)
 - `scripts/setup-overlay.ts` — 可重现的 node_modules patch
 
-## 已验证能力（全部实测通过）
+## 已验证能力（在测试服实测）
 
-移动/A*寻路（含挖穿模式+目标高度自适应）、挖掘（长挖掘心跳维持）、放置、攻击（26.3 独立 attack 包）、
-库存跟踪、箱子存取、2×2 合成、掉落物拾取、聊天收发、第一人称/俯视视觉、场景 JSON、自动复活。
-端到端演示：砍树→拾取 4 原木→存箱→聊天汇报 ✓
+- 移动: 开门穿屋、爬梯子、游泳过 5 格深水道、搭桥过 3 格宽深沟、原地垫高 4 格、248 格远程分段 (含从海里出发)、原生地形 6 条路线
+- 采集/合成: 空背包起步 砍树→木板→木棍→工作台(自动放置)→木镐→挖进地下取石头→石镐, 7 次 act 约 45 秒; 高树干自动垫高去砍; 熔炉自动放置+选煤, 3 生铁→3 铁锭
+- 反射: 僵尸近身自动换铁剑击杀不掉血; 苦力怕靠近逃到 12 格外; 饥饿时自动挑牛排吃 (不吃腐肉); 1×1 岩浆脱困 3/3; 沉到海底会浮上水面; 天黑自动回家睡觉
+- 交互: 拉杆、白天睡觉被拒 (中文原因)、夜里睡觉到天亮、村民交易 (列表/按次数/材料不够时停)、喂两头牛繁殖出小牛、上下矿车、穿盔甲/盾进副手、箱子存取
 
 ## 寻路设计（v2）
 
 ```
-move_to{x,z} → 目标列高度自适应(±8) → A*(邻居: 平走/斜走/跳1格/下落≤4/平挖穿2格/楼梯上挖3格/浅水深1)
-            → 航点跟随(到达半径1.6/终点2.0, 航点跳跃跳过, 卡墙跳, 侧移脱困, 5s重规划×4)
-            → 挖穿航点: 每格只发一次 block_dig START(重发会重置服务器进度!), 乐观更新本地模型
+move_to{x,z} → 远 (>64 格) 或目标未加载: 朝目标取中途点 (优先陆地, 不通换角度/缩短), 逐段规划
+            → 目标列高度自适应(±8, 水面不选水底; tolerance=0 且给 y 时不自适应)
+            → A* (二叉堆, 加权启发 ×1.5, 单次 ≤150ms): 平走/斜走(不切角)/跳1格/下落≤4/平挖/上挖/下挖/
+               门(执行时开)/梯子藤蔓/游泳/垫高(仅目标更高时)/搭桥; 不挖箱子/门/床等功能方块和岩浆旁的格
+            → 航点跟随 + 卡住侧移/跳 + 5s 重规划×5; 挖穿时按工具估算挖掘时间再发 STOP
 ```
 
-原生地形实测 25-30 格 3/3 成功。挖掘机制关键认知：**26.x 服务器在最后一次 START 后 ~2 秒由 tick 自动完成破坏**，客户端 STOP 只是加速确认；重复 START 会重置进度（这是之前"挖不动/假失败"的根因）。
+挖掘机制关键认知：重复 START 会重置服务器端进度（之前"挖不动/假失败"的根因），所以只在预计时间 +4s 仍未破坏时才重试。
 
 ## 已知限制
 
-- 垂直断崖 >2 格且无楼梯空间时仍会失败（后续可加垫方块 pillar-up）
+- 掉进 3×3 以上岩浆池中央基本必死 (原版岩浆里移动速度 ~0.7 格/秒, 满血约 2.4 秒烧死); 预防靠寻路避开岩浆、不挖岩浆旁的方块
+- 只能上/下载具, 不能驾驶 (马/船/猪需要 vehicle_move/player_input 转向)
+- 远程兵 (骷髅) 只在近身时还击, 不会主动追击; 无盾牌格挡/弓箭
+- 下界/末地高度仍按主世界 -64..320 解析
 - 第一人称图有实体叠加（敌对红/被动蓝/物品黄），但无贴图细节（语义调色板）
-- 挂机会被怪打死（有自动复活）；调试时可 `difficulty peaceful`
-- M4 的 eat/drop_item 动作已实现未逐一实测
-- 自残式深坑（测试挖掘造成）等极端地形需要多次重规划或失败

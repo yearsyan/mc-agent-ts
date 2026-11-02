@@ -25,10 +25,10 @@ export function renderView (world: World, eye: { x: number, y: number, z: number
   const png = new PNG({ width: W, height: H })
   const yaw = (yawDeg * Math.PI) / 180
   const pitch = (pitchDeg * Math.PI) / 180
-  // 视线基向量 (MC 语义: yaw 0=+z(南), pitch -90=正下 +90=正上)
+  // 视线基向量 (原版语义: yaw 0=+z(南), pitch +90=正下 -90=正上)
   const forward = {
     x: -Math.sin(yaw) * Math.cos(pitch),
-    y: Math.sin(pitch),
+    y: -Math.sin(pitch),
     z: Math.cos(yaw) * Math.cos(pitch),
   }
   const right = {
@@ -73,7 +73,7 @@ function drawEntities (png: PNG, ents: { x: number, y: number, z: number, type: 
   if (!ents.length) return
   const yaw = (yawDeg * Math.PI) / 180
   const pitch = (pitchDeg * Math.PI) / 180
-  const forward = { x: -Math.sin(yaw) * Math.cos(pitch), y: Math.sin(pitch), z: Math.cos(yaw) * Math.cos(pitch) }
+  const forward = { x: -Math.sin(yaw) * Math.cos(pitch), y: -Math.sin(pitch), z: Math.cos(yaw) * Math.cos(pitch) }
   const right = { x: -Math.cos(yaw), y: 0, z: -Math.sin(yaw) }
   const up = { x: right.y * forward.z - right.z * forward.y, y: right.z * forward.x - right.x * forward.z, z: right.x * forward.y - right.y * forward.x }
   const aspect = W / H
@@ -175,15 +175,18 @@ export function renderMap (world: World, center: { x: number, z: number }, param
   const H = W
   const png = new PNG({ width: W, height: H })
 
-  for (let pz = 0; pz < H; pz++) {
-    for (let px = 0; px < W; px++) {
-      const wx = Math.floor(center.x) - R + Math.floor(px / scale)
-      const wz = Math.floor(center.z) - R + Math.floor(pz / scale)
-      const idx = (pz * W + px) << 2
+  // 每个世界列只算一次 (scale 倍放大时同一列对应 scale² 个像素)
+  const N = R * 2
+  const colRgb = new Uint8Array(N * N * 3)
+  for (let cz = 0; cz < N; cz++) {
+    for (let cx = 0; cx < N; cx++) {
+      const wx = Math.floor(center.x) - R + cx
+      const wz = Math.floor(center.z) - R + cz
+      const o = (cz * N + cx) * 3
       const hy = world.highestBlockY(wx, wz)
       if (hy < world.min_y) {
         // 未知区块: 深灰
-        png.data[idx] = 40; png.data[idx + 1] = 40; png.data[idx + 2] = 46; png.data[idx + 3] = 255
+        colRgb[o] = 40; colRgb[o + 1] = 40; colRgb[o + 2] = 46
         continue
       }
       const b = world.getBlock(wx, hy, wz)
@@ -191,9 +194,18 @@ export function renderMap (world: World, center: { x: number, z: number }, param
       // 高度着色: 越高越亮
       const h = Math.max(0, Math.min(1, (hy - world.min_y) / world.world_height))
       const shade = 0.55 + h * 0.45
-      png.data[idx] = Math.min(255, c.r * shade)
-      png.data[idx + 1] = Math.min(255, c.g * shade)
-      png.data[idx + 2] = Math.min(255, c.b * shade)
+      colRgb[o] = Math.min(255, c.r * shade)
+      colRgb[o + 1] = Math.min(255, c.g * shade)
+      colRgb[o + 2] = Math.min(255, c.b * shade)
+    }
+  }
+  for (let pz = 0; pz < H; pz++) {
+    for (let px = 0; px < W; px++) {
+      const o = (Math.floor(pz / scale) * N + Math.floor(px / scale)) * 3
+      const idx = (pz * W + px) << 2
+      png.data[idx] = colRgb[o]
+      png.data[idx + 1] = colRgb[o + 1]
+      png.data[idx + 2] = colRgb[o + 2]
       png.data[idx + 3] = 255
     }
   }
@@ -240,7 +252,7 @@ export function viewHitHistogram (world: World, eye: { x: number, y: number, z: 
   const fov = (fovDeg * Math.PI) / 180
   const yaw = (yawDeg * Math.PI) / 180
   const pitch = (pitchDeg * Math.PI) / 180
-  const forward = { x: -Math.sin(yaw) * Math.cos(pitch), y: Math.sin(pitch), z: Math.cos(yaw) * Math.cos(pitch) }
+  const forward = { x: -Math.sin(yaw) * Math.cos(pitch), y: -Math.sin(pitch), z: Math.cos(yaw) * Math.cos(pitch) }
   const right = { x: -Math.cos(yaw), y: 0, z: -Math.sin(yaw) }
   const up = { x: right.y * forward.z - right.z * forward.y, y: right.z * forward.x - right.x * forward.z, z: right.x * forward.y - right.y * forward.x }
   const aspect = W / H
@@ -284,7 +296,7 @@ export function lookAtBlock (world: World, eye: { x: number, y: number, z: numbe
   const yaw = (yawDeg * Math.PI) / 180
   const pitch = (pitchDeg * Math.PI) / 180
   const dx = -Math.sin(yaw) * Math.cos(pitch)
-  const dy = Math.sin(pitch)
+  const dy = -Math.sin(pitch)
   const dz = Math.cos(yaw) * Math.cos(pitch)
 
   let x = Math.floor(eye.x), y = Math.floor(eye.y), z = Math.floor(eye.z)

@@ -18,9 +18,33 @@ export interface TrackedEntity {
   z: number
   firstSeen: number
   lastUpdate: number
+  /** 掉落物实体的物品 (entity_metadata 下发) */
+  item?: string
+  itemCount?: number
 }
 
 const AIR = new Set(['air', 'cave_air', 'void_air'])
+
+// stateId -> 方块名 查表 (避免 chunk.getBlock 每次构造 prismarine-block 对象, 那是热路径的主要开销)
+const NAME_BY_STATE: string[] = []
+for (const b of mcData.blocksArray as any[]) {
+  for (let s = b.minStateId; s <= b.maxStateId; s++) NAME_BY_STATE[s] = b.name
+}
+const AIR_STATES = new Set<number>()
+for (const n of AIR) {
+  const b = mcData.blocksByName[n]
+  if (b) for (let s = b.minStateId; s <= b.maxStateId; s++) AIR_STATES.add(s)
+}
+const blockName = (stateId: number) => NAME_BY_STATE[stateId] ?? `unknown_${stateId}`
+
+/** section 内可能出现的 stateId; null = 直接调色板 (无法预判, 需逐格扫描) */
+function sectionStates (section: any): number[] | null {
+  const data = section?.data
+  if (!data) return [0]
+  if (Array.isArray(data.palette)) return data.palette // Indirect (可能含已不存在的旧条目, 仅作过滤)
+  if (typeof data.value === 'number') return [data.value] // SingleValue
+  return null // Direct
+}
 const NON_SOLID = new Set([
   ...AIR, 'water', 'lava', 'snow', 'short_grass', 'tall_grass', 'fern', 'large_fern', 'dead_bush',
   'structure_void', 'light', 'bubble_column',
@@ -60,16 +84,15 @@ export class World {
 
   get chunkCount () { return this.chunks.size }
 
-  getBlock (x: number, y: number, z: number): { name: string, stateId: number, biome?: number } | null {
+  getBlock (x: number, y: number, z: number): { name: string, stateId: number } | null {
     if (y < this.min_y || y >= this.min_y + this.world_height) return null
     const cx = Math.floor(x) >> 4
     const cz = Math.floor(z) >> 4
     const chunk = this.chunks.get(ck(cx, cz))
     if (!chunk) return null
     try {
-      const b = chunk.getBlock({ x: Math.floor(x) & 15, y: Math.floor(y), z: Math.floor(z) & 15 })
-      if (!b) return null
-      return { name: b.name, stateId: b.stateId, biome: b.biome }
+      const stateId = chunk.getBlockStateId({ x: Math.floor(x) & 15, y: Math.floor(y), z: Math.floor(z) & 15 })
+      return { name: blockName(stateId), stateId }
     } catch {
       return null
     }
@@ -94,9 +117,14 @@ export class World {
     if (!chunk) return this.min_y - 1
     const lx = Math.floor(x) & 15
     const lz = Math.floor(z) & 15
-    for (let y = this.min_y + this.world_height - 1; y >= this.min_y; y--) {
-      const b = chunk.getBlock({ x: lx, y, z: lz })
-      if (b && !AIR.has(b.name)) return y
+    const sections: any[] = chunk.sections ?? []
+    for (let si = sections.length - 1; si >= 0; si--) {
+      const states = sectionStates(sections[si])
+      if (states && states.every(s => AIR_STATES.has(s))) continue // 整段空气, 跳过
+      const data = sections[si].data
+      for (let ly = 15; ly >= 0; ly--) {
+        if (!AIR_STATES.has(data.get((ly << 8) | (lz << 4) | lx))) return this.min_y + si * 16 + ly
+      }
     }
     return this.min_y - 1
   }
@@ -119,7 +147,8 @@ export class World {
   }
 
   setBlocksBulk (p: any) {
-    // 26.3 格式: chunkCoordinates{x,z=chunk坐标, y=section索引} + records[]= (stateId<<12)|(y<<8|z<<4|x)
+    // 26.3 格式: chunkCoordinates{x,z=chunk坐标, y=section索引} + records[]= (stateId<<12)|(x<<8|z<<4|y)
+    // (原版 SectionPos.sectionRelativePos: x 在高 4 位, y 在低 4 位)
     const cc = p.chunkCoordinates ?? {}
     const cx = cc.x, cz = cc.z, sectionY = cc.y
     if (cx === undefined) return
@@ -128,9 +157,9 @@ export class World {
     try {
       for (const r of p.records ?? []) {
         const local = Number(BigInt.asIntN(32, BigInt(r)) & 0xfffn)
-        const lx = local & 15
-        const ly = (local >> 4) & 15
-        const lz = (local >> 8) & 15
+        const ly = local & 15
+        const lz = (local >> 4) & 15
+        const lx = (local >> 8) & 15
         const stateId = Number(BigInt(r) >> 12n)
         chunk.setBlockStateId({ x: lx, y: sectionY * 16 + ly, z: lz }, stateId)
       }
@@ -189,34 +218,52 @@ export class World {
     e.lastUpdate = Date.now()
   }
 
+  setEntityItem (entityId: number, item: string, count: number) {
+    const e = this.entities.get(entityId)
+    if (e) { e.item = item; e.itemCount = count }
+  }
+
   trackDestroy (ids: number[]) {
     for (const id of ids) this.entities.delete(id)
   }
 
-  /** 在已加载区块中找指定方块 (限 agent 附近 radius 格, 最多 maxHits 个) */
-  findBlock (name: string, cx: number, cz: number, radius = 48, maxHits = 5): { x: number, y: number, z: number }[] {
-    const hits: { x: number, y: number, z: number }[] = []
+  /**
+   * 在已加载区块中找指定方块, 返回离 (cx,cy,cz) 最近的 maxHits 个。
+   * 先按 section 调色板过滤 (绝大多数 section 不含目标, 直接跳过), 命中的 section 才逐格读 stateId。
+   */
+  findBlock (name: string, cx: number, cz: number, radius = 48, maxHits = 5, cy?: number): { x: number, y: number, z: number }[] {
+    const def = mcData.blocksByName[name]
+    if (!def) return []
+    const lo = def.minStateId, hi = def.maxStateId
+    const match = (s: number) => s >= lo && s <= hi
     const r2 = radius * radius
+    const best: { x: number, y: number, z: number, d: number }[] = [] // 按距离升序, 长度 ≤ maxHits
     for (const [key, chunk] of this.chunks) {
       const [ccx, ccz] = key.split(',').map(Number)
       const wx0 = ccx * 16, wz0 = ccz * 16
-      // 粗裁剪: 区块中心距 (cx,cz) 超过 radius+8 跳过
+      // 粗裁剪: 区块中心距 (cx,cz) 超过 radius+12 跳过
       if ((wx0 + 8 - cx) ** 2 + (wz0 + 8 - cz) ** 2 > (radius + 12) ** 2) continue
-      for (let lx = 0; lx < 16 && hits.length < maxHits; lx++) {
-        for (let lz = 0; lz < 16 && hits.length < maxHits; lz++) {
-          for (let ly = this.world_height - 1; ly >= 0; ly--) {
-            const y = this.min_y + ly
-            const wx = wx0 + lx, wz = wz0 + lz
-            if ((wx - cx) ** 2 + (wz - cz) ** 2 > r2) continue
-            try {
-              const b = chunk.getBlock({ x: lx, y, z: lz })
-              if (b && b.name === name) { hits.push({ x: wx, y, z: wz }); if (hits.length >= maxHits) break }
-            } catch {}
-          }
+      const sections: any[] = chunk.sections ?? []
+      for (let si = 0; si < sections.length; si++) {
+        const states = sectionStates(sections[si])
+        if (states && !states.some(match)) continue
+        const data = sections[si].data
+        const y0 = this.min_y + si * 16
+        for (let i = 0; i < 4096; i++) {
+          if (!match(data.get(i))) continue
+          const wx = wx0 + (i & 15), wz = wz0 + ((i >> 4) & 15), y = y0 + (i >> 8)
+          const h2 = (wx - cx) ** 2 + (wz - cz) ** 2
+          if (h2 > r2) continue
+          const d = cy === undefined ? h2 : h2 + (y - cy) ** 2
+          if (best.length >= maxHits && d >= best[best.length - 1].d) continue
+          let k = best.length
+          while (k > 0 && best[k - 1].d > d) k--
+          best.splice(k, 0, { x: wx, y, z: wz, d })
+          if (best.length > maxHits) best.pop()
         }
       }
     }
-    return hits
+    return best.map(({ x, y, z }) => ({ x, y, z }))
   }
 
   nearbyEntities (x: number, y: number, z: number, radius: number): TrackedEntity[] {

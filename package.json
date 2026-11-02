@@ -11,7 +11,7 @@
     "postinstall": "python3 scripts/apply_nmp_patch.py third_party/patches/nmp-entityDelta.diff node_modules/minecraft-protocol || true; tsx scripts/setup-overlay.ts || true",
     "stop": "bash scripts/stop-api.sh",
     "smoke": "node scripts/smoke.mjs",
-    "build": "tsc"
+    "build": "tsc && cp src/http/webui.html dist/src/http/"
   },
   "engines": {
     "node": ">=22"
