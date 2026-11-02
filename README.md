@@ -1,5 +1,11 @@
 # mc-agent — Minecraft 26.3 LLM Agent Bot
 
+> **免责声明**：本仓库为非官方社区项目，与 Mojang Studios / Microsoft 无任何关联，亦未获其认可。
+> 仓库不包含、也不分发任何 Minecraft 游戏代码、资源或反编译产物；
+> `third_party/` 中的协议数据来自 MIT 许可的 PrismarineJS/minecraft-data（见 [third_party/NOTICE.md](third_party/NOTICE.md)）。
+> "Minecraft" 是 Mojang Synergies AB 的商标，此处仅作兼容性描述。
+> 许可证：[MIT](LICENSE)（third_party 部分遵循其原始许可证）。
+
 自研协议 bot：以原生 protocol 777 (Minecraft 26.3) 直连 Fabric 服务器，通过 MCP 让任意 LLM（含 ZCode）操控游戏内 agent。
 
 ## 架构
@@ -64,7 +70,7 @@ python3 scripts/mcp_call.py <Agent_A|admin> tools/call '{"name":"get_scene","arg
 - `src/vision/` — raycast 渲染 + 调色板
 - `src/http/serve.ts` — HTTP API
 - `src/mcp/server.ts` — MCP stdio
-- `third_party/` — 26.2/26.3 数据文件 (来自 minecraft-data PR #1301 分支)
+- `third_party/` — 26.2/26.3 数据文件 (来自 minecraft-data PR #1301 分支, MIT, 见 NOTICE.md)
 - `scripts/setup-overlay.ts` — 可重现的 node_modules patch
 
 ## 已验证能力（全部实测通过）
