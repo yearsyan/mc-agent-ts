@@ -113,6 +113,8 @@ class AgentManager {
       name: b.name, phase: b.phase,
       position: { x: +b.pos.x.toFixed(1), y: +b.pos.y.toFixed(1), z: +b.pos.z.toFixed(1) },
       health: +b.health.toFixed(1),
+      ...(b.dead ? { dead: true } : {}),
+      deaths: b.deaths,
     }))
   }
 }
@@ -141,6 +143,9 @@ function scene (bot: BotAgent) {
     facing: { yaw: Math.round(bot.yaw), pitch: Math.round(bot.pitch) },
     health: +bot.health.toFixed(1),
     food: bot.food,
+    ...(bot.dead ? { dead: true } : {}),
+    deaths: bot.deaths,
+    ...(bot.deathInfo() ? { last_death: bot.deathInfo() } : {}),
     held: bot.inventory.held() ? `${bot.inventory.held()!.name}×${bot.inventory.held()!.count}` : null,
     time: { day_time: bot.dayTime, night: isNight(bot.dayTime) },
     ...(bot.sleeping ? { sleeping: true } : {}),
@@ -171,7 +176,10 @@ const TOOLS: Tool[] = [
   tool('get_view', '第一人称合成视觉 PNG (含实体叠加: 红=敌对 蓝=动物 黄=掉落物)', { name: { type: 'string', description: '[admin]角色名' }, width: { type: 'number' }, height: { type: 'number' }, fov: { type: 'number', description: '水平FOV度' } }),
   tool('get_map', '顶视地图 PNG (红点=自己, 实体色点)', { name: { type: 'string', description: '[admin]角色名' }, radius: { type: 'number' }, scale: { type: 'number' } }),
   tool('read_chat', '读聊天消息 (seq 递增可增量拉取)', { name: { type: 'string', description: '[admin]角色名' }, since: { type: 'number' } }),
-  tool('say', '游戏内聊天发言', { name: { type: 'string', description: '[admin]角色名' }, text: { type: 'string' } }, ['text']),
+  tool('say', '游戏内聊天发言 (不执行命令)', { name: { type: 'string', description: '[admin]角色名' }, text: { type: 'string' } }, ['text']),
+  tool('run_command', '以本角色身份执行服务器命令 (如 /seed /list /msg; 可加可不加 "/")。权限由服务器决定 (bot 不是 OP 时管理命令会被拒, 结果里附可用命令列表)。返回服务器回给你的消息', {
+    name: { type: 'string', description: '[admin]角色名' }, command: { type: 'string' }, waitMs: { type: 'number', description: '等回复的最长毫秒数, 默认 2000' },
+  }, ['command']),
   tool('look', '转向 (yaw: 0=南 90=西 180=北 -90=东; pitch: 90=正下 -90=正上)', { name: { type: 'string', description: '[admin]角色名' }, yaw: { type: 'number' }, pitch: { type: 'number' } }),
   tool('act', `执行动作 (异步, 返回 actionId, 用 wait_action 等结果; 新的主动作会取消正在进行的主动作):
 移动: move_to{x,z,y?,tolerance?} (自动开门/爬梯/游泳/垫方块/搭桥/挖穿, 远距离分段) | go_home | jump | stop
@@ -181,9 +189,10 @@ const TOOLS: Tool[] = [
 物品: equip{item} (工具→手上, 盔甲→身上, 盾→副手) | eat{item?} | use_item{item?,hold_ms?} | select_slot{slot 0-8} | drop_item{slot,all}
 交互: use_block{x,y,z,item?} (门/拉杆/按钮等) | sleep{x?,y?,z?} | wake | interact_entity{entity_id,item?} (喂食繁殖/剪毛/骑乘) | dismount | trade{entity_id,index?,times?} (不给 index 返回交易列表)
 战斗: attack{entity_id,hits?} (自动换最好的武器)
-容器: open_container{x,y,z} | chest_take{slot} | chest_put{slot} | close_window`, {
+容器: open_container{x,y,z} | chest_take{slot} | chest_put{slot} | close_window
+死亡: 死亡时所有动作以"死亡: 死因"取消, scene.last_death 给出死因/地点/掉落物剩余时间, 聊天里也有提示; respawn (仅 autoRespawn=false 时需要)`, {
     name: { type: 'string', description: '[admin]角色名' },
-    type: { type: 'string', enum: ['move_to', 'go_home', 'jump', 'stop', 'collect', 'dig', 'pickup_items', 'place', 'craft', 'smelt', 'equip', 'eat', 'use_item', 'select_slot', 'drop_item', 'use_block', 'sleep', 'wake', 'interact_entity', 'mount', 'dismount', 'trade', 'attack', 'open_container', 'chest_take', 'chest_put', 'close_window', 'craft_planks'] },
+    type: { type: 'string', enum: ['move_to', 'go_home', 'jump', 'stop', 'collect', 'dig', 'pickup_items', 'place', 'craft', 'smelt', 'equip', 'eat', 'use_item', 'select_slot', 'drop_item', 'use_block', 'sleep', 'wake', 'interact_entity', 'mount', 'dismount', 'trade', 'attack', 'open_container', 'chest_take', 'chest_put', 'close_window', 'respawn', 'craft_planks'] },
     x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, face: { type: 'number' }, tolerance: { type: 'number', description: 'move_to 到达容差, 0=精确' },
     item: { type: 'string', description: '物品名, 如 oak_planks / wooden_pickaxe / bread' }, block: { type: 'string', description: '方块名, 如 oak_log / stone / iron_ore' },
     count: { type: 'number' }, radius: { type: 'number' }, fuel: { type: 'string' },
@@ -192,10 +201,11 @@ const TOOLS: Tool[] = [
   }, ['type']),
   tool('set_policy', `设置反射策略 (bot 自主执行, 不等你决策; 只传要改的字段):
 autoEat(bool) 自动进食 | eatAt(饱食度阈值, 默认 14) | combat: defend(还击, 默认)/flee(见怪就跑)/ignore | fleeHealth(血量低于此值逃跑, 默认 8)
-avoidHazards(bool) 逃离岩浆/火/溺水 | nightShelter(bool) 天黑空闲时回家睡觉 | home: "here" 或 {x,y,z} 或 null`, {
+avoidHazards(bool) 逃离岩浆/火/溺水 | nightShelter(bool) 天黑空闲时回家睡觉 | home: "here" 或 {x,y,z} 或 null
+autoRespawn(bool) 死亡后自动复活 (默认 true; false 则停在死亡界面等 act respawn)`, {
     name: { type: 'string', description: '[admin]角色名' },
     autoEat: { type: 'boolean' }, eatAt: { type: 'number' }, combat: { type: 'string', enum: ['defend', 'flee', 'ignore'] }, fleeHealth: { type: 'number' },
-    avoidHazards: { type: 'boolean' }, nightShelter: { type: 'boolean' }, home: { description: '"here" | {x,y,z} | null' },
+    avoidHazards: { type: 'boolean' }, nightShelter: { type: 'boolean' }, autoRespawn: { type: 'boolean' }, home: { description: '"here" | {x,y,z} | null' },
   }),
   tool('wait_action', '等待动作完成', { name: { type: 'string', description: '[admin]角色名' }, actionId: { type: 'number' }, timeoutMs: { type: 'number' } }),
   tool('get_block', '查询方块 (x,y,z) + 该列最高方块', { name: { type: 'string', description: '[admin]角色名' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, ['x', 'y', 'z']),
@@ -264,10 +274,15 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
       return img(await pngBuffer(png))
     }
     case 'read_chat': return txt(JSON.stringify(bot.readChat(Number(args.since ?? 0))))
-    case 'say': bot.say(String(args.text ?? '').slice(0, 256)); return txt(JSON.stringify({ ok: true }))
+    case 'say': {
+      const t = String(args.text ?? '')
+      if (t.startsWith('/')) return txt(JSON.stringify({ ok: false, error: 'say 只发聊天, 执行命令请用 run_command' }))
+      bot.say(t.slice(0, 256)); return txt(JSON.stringify({ ok: true }))
+    }
+    case 'run_command': return txt(JSON.stringify(await bot.runCommand(String(args.command ?? ''), Math.max(300, Math.min(10_000, Number(args.waitMs ?? 2000)))), null, 1))
     case 'set_policy': {
       const p: any = { ...bot.reflex.policy }
-      for (const k of ['autoEat', 'avoidHazards', 'nightShelter']) if (typeof args[k] === 'boolean') p[k] = args[k]
+      for (const k of ['autoEat', 'avoidHazards', 'nightShelter', 'autoRespawn']) if (typeof args[k] === 'boolean') p[k] = args[k]
       for (const k of ['eatAt', 'fleeHealth']) if (args[k] !== undefined && Number.isFinite(Number(args[k]))) p[k] = Math.max(0, Math.min(20, Number(args[k])))
       if (['defend', 'flee', 'ignore'].includes(args.combat)) p.combat = args.combat
       if (args.home === 'here') p.home = { x: Math.floor(bot.pos.x), y: Math.floor(bot.pos.y), z: Math.floor(bot.pos.z) }
@@ -493,6 +508,9 @@ async function handleWebuiApi (req: http.IncomingMessage, res: http.ServerRespon
           position: online ? { x: +bot!.pos.x.toFixed(1), y: +bot!.pos.y.toFixed(1), z: +bot!.pos.z.toFixed(1) } : null,
           health: online ? +bot!.health.toFixed(1) : null,
           food: online ? bot!.food : null,
+          dead: online ? bot!.dead : false,
+          deaths: online ? bot!.deaths : 0,
+          lastDeath: online && bot!.lastDeath ? bot!.lastDeath.cause : null,
           action: a ? { id: a.id, type: a.type, status: a.status, detail: a.detail } : null,
           lastLogAt: oplog.lastAt(n),
         }

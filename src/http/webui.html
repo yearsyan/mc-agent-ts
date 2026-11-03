@@ -294,6 +294,8 @@ function agentCard (a) {
     : el('span', { class: 'pill ' + a.status }, STATUS_LABEL[a.status])
   const meta = []
   if (a.position) meta.push(`(${a.position.x}, ${a.position.y}, ${a.position.z})`, `血量 ${a.health}`, `饱食 ${a.food}`)
+  if (a.dead) meta.push('☠ 死亡中')
+  if (a.deaths) meta.push(`死亡 ${a.deaths} 次${a.lastDeath ? ` (最近: ${a.lastDeath})` : ''}`)
   if (a.action) meta.push(`动作 #${a.action.id} ${a.action.type} ${ACTION_LABEL[a.action.status] || a.action.status}`)
   meta.push('最近活动 ' + ago(a.lastLogAt))
 

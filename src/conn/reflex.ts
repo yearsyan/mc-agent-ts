@@ -24,9 +24,11 @@ export interface Policy {
   /** 天黑且空闲时回家 (需设 home), 家附近有床就睡 */
   nightShelter: boolean
   home: { x: number, y: number, z: number } | null
+  /** 死亡后自动复活 (关掉则停在死亡界面, 由 act{type:"respawn"} 手动复活) */
+  autoRespawn: boolean
 }
 
-export const DEFAULT_POLICY: Policy = { autoEat: true, eatAt: 14, combat: 'defend', fleeHealth: 8, avoidHazards: true, nightShelter: false, home: null }
+export const DEFAULT_POLICY: Policy = { autoEat: true, eatAt: 14, combat: 'defend', fleeHealth: 8, avoidHazards: true, nightShelter: false, home: null, autoRespawn: true }
 
 export interface ReflexEvent { at: number, text: string }
 
@@ -259,6 +261,15 @@ export class Reflex {
       if (w.isSolid(Math.floor(px), fy, Math.floor(pz)) || w.isSolid(Math.floor(px), fy + 1, Math.floor(pz))) return false
     }
     return true
+  }
+
+  /** 死亡: 丢掉进行中的反射任务/逃生状态 (动作本身由 bot.cancelActions 取消) */
+  onDeath (cause: string) {
+    this.task = null
+    this.escape = null
+    this.state = 'idle'
+    this.eatFailCount = 0
+    this.log(`死亡: ${cause}`)
   }
 
   status () {

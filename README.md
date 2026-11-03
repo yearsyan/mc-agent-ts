@@ -50,7 +50,8 @@ python3 scripts/mcp_call.py <Agent_A|admin> tools/call '{"name":"get_scene","arg
 | `get_scene(name)` | 位置/朝向/血量/饱食/手持/时间(昼夜)/背包汇总/脚下方块/准星指向/附近实体(类型/掉落物内容/敌对标记/方位/距离)/反射层状态 |
 | `get_view(name, w, h, fov)` | 第一人称 raycast 合成 PNG |
 | `get_map(name, r, s)` | 顶视地图 PNG（红点=self，红/蓝点=敌对/被动实体） |
-| `read_chat(name, since)` / `say(name, text)` | 聊天收发 |
+| `read_chat(name, since)` / `say(name, text)` | 聊天收发。消息按聊天类型渲染 (`* A 挥手` / `A 悄悄对你说: …` / `[Rcon] …`), 带 `key` (翻译键或聊天类型) 与 `self` (自己发的) |
+| `run_command(name, command, waitMs?)` | 以角色身份执行服务器命令 (`chat_command`, 无签名), 返回服务器回给自己的消息。**不设白名单, 权限完全由服务器决定** (bot 非 OP 时 `/seed` `/time` 等被拒, 结果附服务器下发的可用命令列表; 默认能用 `/msg` `/w` `/me` `/list` `/random` `/help` `/trigger` 等)。参数写错时 error 区分"无权限"和"参数不完整" |
 | `act(name, type, ...)` | 异步动作, 见下表 |
 | `set_policy(name, ...)` | 反射策略 (bot 自主执行, 见下) |
 | `wait_action(name, actionId?, timeoutMs)` | 等动作完成 (不带 id = 最近一个) |
@@ -68,6 +69,15 @@ python3 scripts/mcp_call.py <Agent_A|admin> tools/call '{"name":"get_scene","arg
 | 交互 | `use_block{x,y,z,item?}` 门/拉杆/按钮… · `sleep{x?,y?,z?}` / `wake` · `interact_entity{entity_id,item?}` 喂食繁殖/剪毛/骑乘 · `mount` / `dismount` · `trade{entity_id,index?,times?}` (不给 index 返回交易列表) |
 | 战斗 | `attack{entity_id,hits?}` 自动换最好的武器 |
 | 容器 | `open_container` · `chest_take{slot}` · `chest_put{slot}` · `close_window` |
+| 死亡 | `respawn` (仅 `autoRespawn=false` 时需要; 死亡期间其他动作直接失败并提示先复活) |
+
+### 死亡感知
+
+- 监听 `death_combat_event` (服务器专门发给死者, 带死亡消息), `update_health≤0` 兜底; 关了 `show_death_messages` 时用最近一次 `damage_event` 的伤害类型 (配置阶段 `registry_data` 的 damage_type 表) + 攻击者推断死因。死着重新登录时用 login 包里的死亡点。
+- 死亡时取消全部动作, detail 为 `死亡: <死因>`; 反射层状态清空。
+- `get_scene`: `dead` (死亡界面中)、`deaths` (本次上线累计)、`last_death` (10 分钟内: 死因/凶手/翻译键/地点/维度/死时物品/`drops_despawn_in_s` 掉落物剩余存活秒数 或 `kept_inventory`)。
+- `read_chat` 推送本地系统消息: `[你死了] 死因 @ 坐标` → `[掉落] N 个物品掉在死亡点…约 5 分钟后消失` / `物品已保留` → `[已复活] @ 坐标`; 服务器的死亡广播也会渲染成中文 (常见死亡翻译键)。
+- 操作日志 (WebUI) 记录 `死亡 #n: 死因 @ 坐标, 掉落 N 个物品` 与复活位置, 角色卡片显示死亡次数和最近死因。
 
 ### 反射层 (`src/conn/reflex.ts`)
 
@@ -79,6 +89,7 @@ LLM 决策一次要数秒, 僵尸几秒就能打死人, 所以保命行为由 bo
 | `combat` / `fleeHealth` | defend / 8 | defend: 敌对生物进入 3.3 格自动换武器还击; 血 ≤ fleeHealth 或遇苦力怕时逃跑。flee: 见怪就跑。ignore |
 | `avoidHazards` | true | 脚下岩浆/火 → 直接接管控制冲向最近的安全格; 氧气不足时上浮; 空闲泡在水里时踩水 |
 | `nightShelter` / `home` | false / null | 天黑且空闲时回家 (`home: "here"` 设当前位置), 家附近有床就睡 |
+| `autoRespawn` | true | 死后 0.8s 自动复活 (未生效每 2s 重试; 死亡中打开也立即生效)。false: 停在死亡界面, 等 `act respawn` |
 
 反射层打断 LLM 的动作时会在该动作的 detail 写明原因 (如 `被反射打断: 迎战 zombie`), 每次介入都进操作日志 (类型 `反射`)。
 
@@ -126,6 +137,8 @@ tokens.json 新增可选字段 `disabled: [角色名]`；`agents` 仍是 `名 �
 - 移动: 开门穿屋、爬梯子、游泳过 5 格深水道、搭桥过 3 格宽深沟、原地垫高 4 格、248 格远程分段 (含从海里出发)、原生地形 6 条路线
 - 采集/合成: 空背包起步 砍树→木板→木棍→工作台(自动放置)→木镐→挖进地下取石头→石镐, 7 次 act 约 45 秒; 高树干自动垫高去砍; 熔炉自动放置+选煤, 3 生铁→3 铁锭
 - 反射: 僵尸近身自动换铁剑击杀不掉血; 苦力怕靠近逃到 12 格外; 饥饿时自动挑牛排吃 (不吃腐肉); 1×1 岩浆脱困 3/3; 沉到海底会浮上水面; 天黑自动回家睡觉
+- 死亡: `/kill` 打断进行中的 move_to (detail `死亡: 被杀死了 (/kill)`); 苦力怕炸死 / 僵尸杀死时死因与凶手正确; keepInventory 开/关两种掉落提示; autoRespawn=false 时停在死亡界面、动作被拒、`act respawn` 复活后走回死亡点捡回物品; 关掉死亡消息时按伤害类型推断; 死着重新登录还原死亡点并自动复活
+- 命令: 非 OP 时 `/seed` `/time` `/gamemode` 被服务器拒绝并列出 12 个可用命令; 临时 op 后 `/seed` 输出与 RCON 一致, deop 后命令树即时收回; 两个 agent 用 `/msg` `/w` 私聊、`/me` 动作, 双方 read_chat 格式正确
 - 交互: 拉杆、白天睡觉被拒 (中文原因)、夜里睡觉到天亮、村民交易 (列表/按次数/材料不够时停)、喂两头牛繁殖出小牛、上下矿车、穿盔甲/盾进副手、箱子存取
 
 ## 寻路设计（v2）
