@@ -5,6 +5,7 @@
 import type { BotAgent } from '../conn/bot.js'
 import { findPath, placementsIn, isOpenable, type PathNode } from './astar.js'
 import { Action, AsyncAction } from './base.js'
+import { fluidHeight } from '../physics/runner.js'
 import { holdSlot, holdItem, holdNothing, prepareHeld, placeBlockAt, faceTowards, reachTo, closeContainer } from './hands.js'
 import { bestToolFor, toolKind, weaponScore, blockProps, SCAFFOLD_BLOCKS, isWatery } from '../game/knowledge.js'
 
@@ -185,7 +186,8 @@ export class MoveToAction extends Action {
     // ---- 到达判定 ----
     const finalWp = this.wpIdx >= this.path.length - 1
     const dyWp = wp.y - bot.pos.y
-    const vertOk = wp.climb || wp.swim ? Math.abs(dyWp) < 0.45 : dyWp < 0.6
+    // 游泳姿态时身体在水面下 ~0.2-0.6 格, 竖直判定放宽
+    const vertOk = bot.swimming ? Math.abs(dyWp) < 1.2 : wp.climb || wp.swim ? Math.abs(dyWp) < 0.45 : dyWp < 0.6
     const arriveR = finalWp ? (this.tol === 0 && !this.segmenting ? 0.4 : 2.0) : (wp.climb ? 0.6 : 1.6)
     if (distWp < arriveR && vertOk && !(finalWp && this.tol === 0 && !bot.onGround && !inWater && !wp.climb)) {
       if (finalWp) {
@@ -218,9 +220,16 @@ export class MoveToAction extends Action {
     c.back = false
     c.sneak = false
     c.sprint = !finalWp && distWp > 6 && !inWater
+    // 冲刺游泳: 前方连续深水航点够长才用 (进入要先下沉到眼睛没水, 短距离不划算); 快到岸时退出, 普通游上岸
+    const swimRun = this.swimRunAhead()
+    const sprintSwim = inWater && bot.food > 6 && (bot.swimming ? swimRun >= 3 : swimRun >= 6 && wp.swim)
     if (wp.climb) {
       c.jump = wp.y > bot.pos.y - 0.05 // 梯子上按跳 = 向上爬
       c.sprint = false
+    } else if (sprintSwim) {
+      c.sprint = true
+      if (bot.swimming) this.holdSwimDepth()
+      else { c.jump = false; c.sneak = true } // 按 shift 下潜, 眼睛没入水中后进入游泳姿态
     } else if (inWater) {
       c.jump = true // 水里按住跳保持浮在水面 / 上岸
     } else {
@@ -381,6 +390,31 @@ export class MoveToAction extends Action {
     const fz = Math.floor(this.bot.pos.z + Math.cos(yawRad))
     const fy = Math.floor(this.bot.pos.y)
     return this.bot.world.isSolid(fx, fy, fz) || this.bot.world.isSolid(fx, fy + 1, fz)
+  }
+
+  /** 从当前航点起连续深水 (游泳) 航点数 */
+  private swimRunAhead () {
+    let n = 0
+    for (let i = this.wpIdx; i < (this.path?.length ?? 0) && this.path![i].swim; i++) n++
+    return n
+  }
+
+  /**
+   * 游泳姿态下保持在水面: 身体顶部露出、眼睛 (眼高 0.4) 刚好在水面上能换气。
+   * 高了低头下潜 (视线 y 分量决定竖直速度), 低了按跳上浮。
+   */
+  private holdSwimDepth () {
+    const bot = this.bot, c = bot.physics.control
+    const x = Math.floor(bot.pos.x), z = Math.floor(bot.pos.z)
+    let by = Math.floor(bot.pos.y)
+    for (let i = 0; i < 4 && fluidHeight(bot.world, x, by + 1, z) > 0; i++) by++
+    const f = fluidHeight(bot.world, x, by, z)
+    if (!f) { c.jump = false; bot.pitch = 0; return }
+    // 目标: 箱底在水面下 0.15 (眼睛 = 箱底 +0.4 露出水面可换气; 箱底低于水面才算在水里, 否则会退出游泳姿态)
+    // 不操作时竖直速度每 tick 约衰减到 0.75 倍, 还会再漂 ≈3.2·vy; 按预测的停稳位置决定上浮/下潜, 避免冲出水面来回振荡
+    const pred = bot.pos.y - (by + f - 0.15) + bot.physics.velocity.y * 3.2
+    c.sneak = false
+    if (pred < -0.05) { bot.pitch = 0; c.jump = true } else if (pred > 0.05) { bot.pitch = Math.min(25, 4 + pred * 40); c.jump = false } else { bot.pitch = 0; c.jump = false }
   }
 
   /** 原地停住 (不结束动作) */

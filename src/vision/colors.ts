@@ -44,6 +44,14 @@ const EXACT: Record<string, string> = {
   smooth_stone: '9e9e9e', smooth_sandstone: 'cfcebe', smooth_red_sandstone: 'bd7351',
   deepslate_bricks: '48474c', polished_deepslate: '48484a', cracked_deepslate_bricks: '403f44',
   polished_blackstone: '403a44', polished_blackstone_bricks: '36313c',
+  poppy: 'd8262a', dandelion: 'f5d932', blue_orchid: '2aa7e0', allium: 'b366e0', azure_bluet: 'e5ebf0',
+  oxeye_daisy: 'eef0e0', cornflower: '4769d6', lily_of_the_valley: 'f4f4f4', wither_rose: '2a2a22',
+  sunflower: 'f5c91e', lilac: 'd39ed8', rose_bush: 'c52a2a', peony: 'e6b5e8', torchflower: 'e8792c',
+  red_tulip: 'd8382a', orange_tulip: 'e8812c', white_tulip: 'f0f0f0', pink_tulip: 'eaa2c4',
+  wheat: 'c9b54a', carrots: '58a83a', potatoes: '5aa33a', beetroots: '5c9a3a', sweet_berry_bush: '3f6e33',
+  dead_bush: '8a6a3a', brown_mushroom: '9a7458', red_mushroom: 'c4302a', wall_torch: 'f9c64f',
+  redstone_wire: '9a1a10', rail: '8a7a66', powered_rail: 'b09040', detector_rail: '8a6a6a', activator_rail: '8a5a5a',
+  ladder: '9c7f4e', lily_pad: '2f7a2a', fire: 'f08a1a', cobweb: 'e8e8e8',
   waystone: '7d8a99',  // modded
   shogi_board: 'c9a06b', // modded (将棋盘)
 }
@@ -59,6 +67,7 @@ const KEYWORDS: [string, string][] = [
   ['terracotta', '976243'], ['prismarine', '639f8f'], ['purpur', 'a97ba9'], ['quartz', 'eae5dd'],
   ['snow', 'f0faf9'], ['ice', '7dadff'], ['mushroom', 'c8a2a2'], ['froglight', 'd8e0b0'],
   ['sculk', '0f2f3c'], ['amethyst', '8560c8'], ['candle', 'f2e6b8'], ['banner', 'a8824f'],
+  ['sapling', '4f8a2a'], ['tulip', 'd8382a'], ['torch', 'f9c64f'], ['fern', '5d9c3f'], ['bed', 'b02e26'],
 ]
 
 const cache = new Map<string, RGB>()

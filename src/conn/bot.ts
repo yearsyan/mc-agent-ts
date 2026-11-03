@@ -17,6 +17,7 @@ import { ShootAction } from '../actions/combat.js'
 import { itemName } from '../game/knowledge.js'
 import type { ChatMessage } from './types.js'
 import { AsyncAction } from '../actions/base.js'
+import { ScriptAction } from '../actions/script.js'
 
 /** 一次死亡的记录 (scene.last_death / 操作日志 / 聊天提示) */
 export interface DeathRecord {
@@ -70,6 +71,10 @@ export class BotAgent {
   pitch = 0
   health = 20
   food = 20
+  private sprintSent = false
+  /** 眼高: 游泳姿态 0.4, 站立 1.62 */
+  get eyeHeight () { return this.physics.eyeHeight }
+  get swimming () { return this.physics.swimming }
   onGround = true
   /** 自己的实体 id (login 下发) */
   entityId = -1
@@ -215,7 +220,7 @@ export class BotAgent {
       client.on('position', (packet: any) => this.handleTeleport(packet))
       // 复活/换维度后原版客户端会重新走一遍加载流程并再发 player_loaded
       client.on('respawn', (p: any) => {
-        this.firstTeleportAt = 0; this.loadedAt = 0; this.sleeping = false; this.vehicleId = null
+        this.firstTeleportAt = 0; this.loadedAt = 0; this.sprintSent = false; this.physics.swimming = false; this.sleeping = false; this.vehicleId = null
         if (p.worldState?.name) this.dimension = p.worldState.name
         if (this.dead) this.onRespawned()
       })
@@ -455,8 +460,14 @@ export class BotAgent {
       return
     }
 
-    // 物理模拟 (动作设置的 control 生效)
+    // 物理模拟 (动作设置的 control 生效); 饱食度 ≤ 6 不能疾跑 (原版规则)
+    this.physics.canSprint = this.food > 6
     this.physics.tick()
+    // 疾跑状态变化告诉服务器 (原版在移动包之前发): 服务器据此判定游泳姿态、计算饥饿
+    if (this.physics.sprinting !== this.sprintSent) {
+      this.sprintSent = this.physics.sprinting
+      this.client.write('entity_action', { entityId: this.entityId, actionId: this.sprintSent ? 'start_sprinting' : 'stop_sprinting', jumpBoost: 0 })
+    }
 
     // 朝向变了才带上 yaw/pitch (服务器用朝向决定放置方块的方向等)
     const flags = { onGround: this.onGround, hasHorizontalCollision: false }
@@ -478,7 +489,8 @@ export class BotAgent {
 
   // ---------- 动作系统 ----------
 
-  act (type: string, params: any): Action {
+  /** 按类型构造动作 (不启动); 脚本里的子动作也走这里 */
+  makeAction (type: string, params: any): Action {
     const int = (v: any, d?: number) => { const n = Math.floor(Number(v ?? d)); if (!Number.isFinite(n)) throw new Error(`参数缺失或不是数字 (动作 ${type})`); return n }
     const xyz = () => [int(params.x), int(params.y), int(params.z)] as const
     const str = (v: any, what: string) => { if (typeof v !== 'string' || !v) throw new Error(`${type} 需要参数 ${what}`); return v }
@@ -520,8 +532,14 @@ export class BotAgent {
         if (!h) throw new Error('还没设置 home (set_policy {home: "here"} 或 {home: {x,y,z}})')
         a = new MoveToAction(this, h, { tolerance: 1 }); break
       }
+      case 'script': a = new ScriptAction(this, String(params.code ?? ''), { timeoutMs: params.timeoutMs, args: params.args }); break
       default: throw new Error(`未知动作类型: ${type}`)
     }
+    return a
+  }
+
+  act (type: string, params: any): Action {
+    const a = this.makeAction(type, params)
     if (this.dead && type !== 'respawn') { this.track(a); this.lastAction = a; a.fail(`已死亡 (${this.lastDeath?.cause ?? '?'}), 先 act{type:"respawn"} 复活`); return a }
     // 主动作互斥: 新主动作取消旧主动作 (库存类动作不参与互斥)
     if (!SIDE_ACTIONS.has(type)) {

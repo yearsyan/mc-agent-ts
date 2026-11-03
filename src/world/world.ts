@@ -51,7 +51,7 @@ for (const n of AIR) {
   const b = mcData.blocksByName[n]
   if (b) for (let s = b.minStateId; s <= b.maxStateId; s++) AIR_STATES.add(s)
 }
-const blockName = (stateId: number) => NAME_BY_STATE[stateId] ?? `unknown_${stateId}`
+export const blockName = (stateId: number) => NAME_BY_STATE[stateId] ?? `unknown_${stateId}`
 
 /** section 内可能出现的 stateId; null = 直接调色板 (无法预判, 需逐格扫描) */
 function sectionStates (section: any): number[] | null {
@@ -85,6 +85,7 @@ export class World {
       const chunk = new Chunk({ minY: this.min_y, worldHeight: this.world_height })
       chunk.load(p.chunkData)
       this.chunks.set(ck(p.x, p.z), chunk)
+      this.lastCx = NaN; this.lastChunk = null
     } catch (e: any) {
       console.warn(`[world] chunk ${p.x},${p.z} 解析失败: ${e.message}`)
     }
@@ -92,6 +93,7 @@ export class World {
 
   unloadChunk (x: number, z: number) {
     this.chunks.delete(ck(x, z))
+    this.lastCx = NaN; this.lastChunk = null
   }
 
   getChunk (cx: number, cz: number) {
@@ -112,6 +114,19 @@ export class World {
     } catch {
       return null
     }
+  }
+
+  private lastCx = NaN
+  private lastCz = NaN
+  private lastChunk: any = null
+  /** 热路径 (渲染): 只取 stateId, 不分配对象; 未加载返回 -1 */
+  stateAt (x: number, y: number, z: number): number {
+    if (y < this.min_y || y >= this.min_y + this.world_height) return -1
+    const cx = x >> 4, cz = z >> 4
+    let chunk = this.lastChunk
+    if (cx !== this.lastCx || cz !== this.lastCz) { chunk = this.chunks.get(ck(cx, cz)); this.lastCx = cx; this.lastCz = cz; this.lastChunk = chunk }
+    if (!chunk) return -1
+    try { return chunk.getBlockStateId({ x: x & 15, y, z: z & 15 }) } catch { return -1 }
   }
 
   isAir (name: string) { return AIR.has(name) }

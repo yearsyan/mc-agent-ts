@@ -16,9 +16,11 @@ import {
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js'
 import { BotAgent } from '../conn/bot.js'
-import { renderView, renderMap, pngBuffer, lookAtBlock } from '../vision/render.js'
+import { ScriptAction } from '../actions/script.js'
+import type { Action } from '../actions/base.js'
+import { renderView, renderMap, pngBuffer, lookAtBlock, type EntityKind, type ViewEntity } from '../vision/render.js'
 import { DEFAULT_POLICY, type Policy } from '../conn/reflex.js'
-import { isHostile, isNight } from '../game/knowledge.js'
+import { isHostile, isNight, entitySize } from '../game/knowledge.js'
 import { TokenStore, maskToken, type Role } from './tokens.js'
 import { OpLog } from './oplog.js'
 
@@ -124,7 +126,7 @@ const manager = new AgentManager()
 // ---------- 场景/渲染 ----------
 
 function scene (bot: BotAgent) {
-  const eye = { x: bot.pos.x, y: bot.pos.y + 1.62, z: bot.pos.z }
+  const eye = { x: bot.pos.x, y: bot.pos.y + bot.eyeHeight, z: bot.pos.z }
   const looking = lookAtBlock(bot.world, eye, bot.yaw, bot.pitch)
   const nearby = bot.world.nearbyEntities(bot.pos.x, bot.pos.y, bot.pos.z, 24)
     .map(e => {
@@ -150,6 +152,7 @@ function scene (bot: BotAgent) {
     time: { day_time: bot.dayTime, night: isNight(bot.dayTime) },
     ...(bot.sleeping ? { sleeping: true } : {}),
     ...(bot.vehicleId !== null ? { riding: bot.vehicleId } : {}),
+    ...(bot.swimming ? { swimming: true } : {}),
     ...(bot.air < 300 ? { air: bot.air } : {}),
     ...(bot.onFire ? { on_fire: true } : {}),
     inventory: bot.inventory.summary(),
@@ -160,6 +163,83 @@ function scene (bot: BotAgent) {
     nearby_entities: nearby,
     world: { chunks_loaded: bot.world.chunkCount },
   }
+}
+
+// 朝向/方位: 原版 yaw 0=南, 90=西, 180=北, -90=东
+const DIRS8 = ['南', '西南', '西', '西北', '北', '东北', '东', '东南']
+const dir8 = (yawDeg: number) => DIRS8[((Math.round(yawDeg / 45) % 8) + 8) % 8]
+const ANIMAL = /(cow|pig|sheep|chicken|horse|donkey|mule|llama|wolf|cat|ocelot|parrot|villager|rabbit|fox|bee|goat|frog|camel|sniffer|allay|turtle|axolotl|panda|polar_bear|armadillo|squid|dolphin|cod|salmon|strider|mooshroom|trader)/
+
+function entityKind (type: string): EntityKind {
+  if (type === 'player') return 'player'
+  if (type === 'item') return 'item'
+  if (isHostile(type)) return 'hostile'
+  if (ANIMAL.test(type)) return 'animal'
+  return 'other'
+}
+
+function viewEntities (bot: BotAgent, radius: number): ViewEntity[] {
+  return bot.world.nearbyEntities(bot.pos.x, bot.pos.y, bot.pos.z, radius)
+    .filter(e => e.id !== bot.entityId && !/arrow|experience_orb|marker|interaction|display/.test(e.type))
+    .map(e => {
+      const { w, h } = entitySize(e.type)
+      return { id: e.id, x: e.x, y: e.y, z: e.z, type: e.type, label: e.type === 'item' ? (e.item ?? 'item') : e.type, kind: entityKind(e.type), w, h }
+    })
+}
+
+const KIND_ZH: Record<EntityKind, string> = { hostile: '敌对', animal: '动物', item: '掉落物', player: '玩家', other: '其他' }
+
+/** get_view: PNG + 文字说明 (朝向/准星/画面内实体编号), 图负责空间关系, 文字给精确数字 */
+async function viewTool (bot: BotAgent, width?: number, height?: number, fov?: number) {
+  const eye = { x: bot.pos.x, y: bot.pos.y + bot.eyeHeight, z: bot.pos.z }
+  const W = Math.max(16, Math.min(640, width ?? 480))
+  const r = await renderView(bot.world, eye, bot.yaw, bot.pitch, { width: W, height: height ?? Math.round(W * 9 / 16), fovDeg: fov ?? 70, entities: viewEntities(bot, 64) })
+  const { width: PW, height: PH } = r.png
+  const look = lookAtBlock(bot.world, eye, bot.yaw, bot.pitch)
+  const where = (sx: number, sy: number) => `${sx < PW / 3 ? '左' : sx > PW * 2 / 3 ? '右' : '中'}${sy < PH / 3 ? '上' : sy > PH * 2 / 3 ? '下' : ''}`
+  const pitchWord = bot.pitch > 15 ? '俯视' : bot.pitch < -15 ? '仰视' : '平视'
+  const lines = [
+    `第一人称 ${PW}×${PH}, 水平 FOV ${Math.round(fov ?? 70)}° · 朝${dir8(bot.yaw)} (yaw ${bot.yaw.toFixed(0)}, pitch ${bot.pitch.toFixed(0)} ${pitchWord}) · 眼睛 (${eye.x.toFixed(1)}, ${eye.y.toFixed(1)}, ${eye.z.toFixed(1)})`,
+    `准星(画面中心十字) → ${look ? `${look.name} (${look.x}, ${look.y}, ${look.z}) 距 ${look.dist} 格` : '天空/超出 80 格'}`,
+  ]
+  const shown = r.entities.filter(e => e.visible > 0)
+  const hidden = r.entities.filter(e => e.visible === 0)
+  if (shown.length) {
+    lines.push('画面中的实体 (图中 #编号 = act 用的 entity_id):')
+    for (const e of shown.slice(0, 20)) lines.push(`  #${e.id} ${e.label} [${KIND_ZH[e.kind]}] 距 ${e.dist} 格, 画面${where(e.sx, e.sy)}${e.visible < 0.6 ? ', 部分被挡' : ''}${e.labeled ? '' : ' (标签放不下)'}`)
+  } else lines.push('画面中没有实体')
+  if (hidden.length) lines.push(`视野方向上但被方块挡住 (图中不画): ${hidden.slice(0, 10).map(e => `#${e.id} ${e.label} 距${e.dist}`).join(', ')}`)
+  lines.push('图例: 框色 红=敌对 蓝=动物 黄=掉落物 白=玩家 橙=其他; 顶部字母为罗盘方位 (N 北 -Z / S 南 +Z / E 东 +X / W 西 -X); 方块边缘描暗线, 一格一格可数; 草花火把画成细块, 玻璃/水半透明')
+  return { buf: await pngBuffer(r.png), text: lines.join('\n') }
+}
+
+/** get_map: 顶视 PNG + 文字说明 */
+async function mapTool (bot: BotAgent, radius?: number, scale?: number, mode?: string) {
+  const ents = viewEntities(bot, 96)
+  const r = renderMap(bot.world, { x: bot.pos.x, y: bot.pos.y, z: bot.pos.z }, {
+    radius, scale, mode: mode as any, entities: ents, self: { x: bot.pos.x, y: bot.pos.y, z: bot.pos.z, yaw: bot.yaw },
+  })
+  const i = r.info
+  const lines = [
+    `顶视地图 ${r.png.width}×${r.png.height}: 上=北(-Z) 下=南(+Z) 右=东(+X) 左=西(-X) · 覆盖 x ${i.x0}..${i.x1}, z ${i.z0}..${i.z1} · 每格 ${i.scale} 像素`,
+    `网格线每 ${i.grid} 格${i.grid === 16 ? ' (= 区块边界)' : ''}; 上边缘数字 = 竖线的 x 坐标, 左边缘数字 = 横线的 z 坐标`,
+    i.mode === 'surface'
+      ? '模式 surface (地表): 每列最高方块的颜色; 明暗 = 起伏 (比北邻高偏亮, 低偏暗), 水越深越暗, 深灰 = 未加载区块'
+      : `模式 slice (按你脚下 y=${i.sliceY} 横切, 地下/室内自动启用): 亮 = 可站立的地面, 暗 = 墙 (身体高度有实心方块), 越黑 = 坑越深, 深灰 = 未加载`,
+    `你: 红色箭头 @ (${bot.pos.x.toFixed(1)}, ${bot.pos.y.toFixed(1)}, ${bot.pos.z.toFixed(1)}), 箭头指向 = 朝${dir8(bot.yaw)}`,
+  ]
+  const inMap = ents.filter(e => e.x >= i.x0 && e.x <= i.x1 + 1 && e.z >= i.z0 && e.z <= i.z1 + 1)
+    .map(e => ({ e, d: Math.hypot(e.x - bot.pos.x, e.z - bot.pos.z) })).sort((a, b) => a.d - b.d)
+  if (inMap.length) {
+    lines.push('实体 (点色同 get_view; 图中 #编号 = entity_id, 掉落物不标号):')
+    for (const { e, d } of inMap.slice(0, 20)) {
+      const bearing = Math.atan2(-(e.x - bot.pos.x), e.z - bot.pos.z) * 180 / Math.PI
+      lines.push(`  #${e.id} ${e.label} [${KIND_ZH[e.kind]}] (${e.x.toFixed(0)}, ${e.y.toFixed(0)}, ${e.z.toFixed(0)}) 水平距 ${d.toFixed(0)} 格, 在你${dir8(bearing)}方${e.y - bot.pos.y > 2 ? ', 高处' : e.y - bot.pos.y < -2 ? ', 低处' : ''}`)
+    }
+    if (inMap.length > 20) lines.push(`  …另有 ${inMap.length - 20} 个`)
+  }
+  if (r.info.mode === 'slice') lines.push('需要看地表时传 mode:"surface"')
+  return { buf: await pngBuffer(r.png), text: lines.join('\n') }
 }
 
 // ---------- MCP 工具 ----------
@@ -174,8 +254,8 @@ const TOOLS: Tool[] = [
   tool('spawn_agent', '[admin] 上线指定角色', { name: { type: 'string', description: '角色名 (见 WebUI / tokens.json)' } }, ['name']),
   tool('kill_agent', '角色下线 (agent token = 自己下线; admin 可指定)', { name: { type: 'string' } }),
   tool('get_scene', '场景: 位置/朝向/血量/脚下方块/准星指向/附近实体(id/类型/方位/距离)', { name: { type: 'string', description: '[admin]角色名' } }),
-  tool('get_view', '第一人称合成视觉 PNG (含实体叠加: 红=敌对 蓝=动物 黄=掉落物)', { name: { type: 'string', description: '[admin]角色名' }, width: { type: 'number' }, height: { type: 'number' }, fov: { type: 'number', description: '水平FOV度' } }),
-  tool('get_map', '顶视地图 PNG (红点=自己, 实体色点)', { name: { type: 'string', description: '[admin]角色名' }, radius: { type: 'number' }, scale: { type: 'number' } }),
+  tool('get_view', '第一人称合成视觉 PNG + 文字说明。实体按真实大小画框并标 #entity_id (被墙挡住的不画), 中心十字=准星, 顶部罗盘; 文字给朝向/准星方块坐标/画面内实体列表', { name: { type: 'string', description: '[admin]角色名' }, width: { type: 'number', description: '默认 480, 最大 640' }, height: { type: 'number', description: '默认 宽×9/16, 最大 360' }, fov: { type: 'number', description: '水平FOV度, 默认 70' } }),
+  tool('get_map', '顶视地图 PNG + 文字说明: 上=北, 网格线每 16 格并在边缘标坐标, 红箭头=自己及朝向, 实体色点标 #entity_id。地下/室内自动切换为脚下高度的横切图', { name: { type: 'string', description: '[admin]角色名' }, radius: { type: 'number', description: '半径格数, 默认 32, 最大 96' }, scale: { type: 'number', description: '每格像素, 默认 6' }, mode: { type: 'string', enum: ['auto', 'surface', 'slice'], description: '默认 auto' } }),
   tool('read_chat', '读聊天消息 (seq 递增可增量拉取; 读过即标为已读)。其他工具的返回末尾出现 {inbox} 表示有人给你发了消息还没看', { name: { type: 'string', description: '[admin]角色名' }, since: { type: 'number' } }),
   tool('say', '游戏内聊天发言 (不执行命令)', { name: { type: 'string', description: '[admin]角色名' }, text: { type: 'string' } }, ['text']),
   tool('run_command', '以本角色身份执行服务器命令 (如 /seed /list /msg; 可加可不加 "/")。权限由服务器决定 (bot 不是 OP 时管理命令会被拒, 结果里附可用命令列表)。返回服务器回给你的消息', {
@@ -211,6 +291,20 @@ ranged: auto(默认, 有弓有箭时远程怪/苦力怕/飞行怪用弓, 空闲�
     avoidHazards: { type: 'boolean' }, nightShelter: { type: 'boolean' }, autoRespawn: { type: 'boolean' }, shield: { type: 'boolean' }, ranged: { type: 'string', enum: ['auto', 'never'] }, home: { description: '"here" | {x,y,z} | null' },
   }),
   tool('wait_action', '等待动作完成。有人给你发消息 (私聊/聊天) 或你死亡时会立即中断等待并返回消息 (interrupted:true, 动作继续执行); interrupt:false 关闭中断', { name: { type: 'string', description: '[admin]角色名' }, actionId: { type: 'number' }, timeoutMs: { type: 'number' }, interrupt: { type: 'boolean', description: '默认 true' } }),
+  tool('run_script', `运行 JS 脚本 (异步, 返回 scriptId; 是一个主动作, 会顶掉当前主动作)。适合重复/有循环的流程 (挖矿道、按规律采集、建造), 一次下发、跑完看结果再决定下一步。
+脚本体是 async 函数体: 可直接 await / return (返回值进 result)。抛错或子动作失败 = 脚本失败 (报行号)。
+动作 (await, 失败抛错, 可 try/catch): moveTo(pos,{tolerance}) dig(pos)→挖掉的方块名(空气返回 null) place(pos,item?,face?) collect(block,count,radius) pickup(r) equip(item) craft(item,n) smelt(item,n,fuel?) eat(item?) attack(id,hits) shoot(id,shots) useBlock(pos,item?) useItem(item?,holdMs) selectSlot(i) sleep(ms) | act(type,params) 通用 (同 act 工具) | tryAct(type,params)→{ok,status,detail} 不抛错
+查询 (同步): pos() here()=脚下方块坐标 block(pos)→名字|null(未加载) isAir(pos) isSolid(pos) reach(pos)=眼睛到方块距离 (挖/放要 ≤4.5) scan(match,r≤24,limit)→[{name,pos,dist}] 近→远 (match: 名字/"*_ore"/数组/正则) findBlock(name,r) inv()→{物品:数量} count(item) freeSlots() held() hp() food() state() entities(r,type?)→[{id,type,pos,dist,hostile}] elapsed()
+坐标: vec(x,y,z) 或 {x,y,z}; Vec 方法 add/sub/offset/mul/up/down/north/south/east/west/right/left/floored/dist/equals; fwd()=当前朝向的水平单位向量 (东南西北之一), dir("north"|...)
+输出: log(...) (进日志) progress(obj) (最新进度快照) say(text); 参数 args 在脚本里是全局变量 args
+追踪: wait_action{actionId:scriptId} 结束时返回完整报告; script_status 看运行中进度。报告含 logs / progress / result / error{line,code} / stats{dug 挖掉的方块, items 物品增减, moved 位移, hp, food, actions 各子动作成败数}
+约束: 循环里必须 await 动作或 sleep (同步执行 >1.5s 会被判死循环); 默认 300s 超时 (timeoutSec 最大 1800); 反射层照常工作 (被怪打/逃跑接管时脚本会被打断, 看 error)。挖掘本身会拒绝挖开旁边有岩浆的方块
+示例: const f = fwd(); let p = here(); for (let i = 0; i < 20; i++) { p = p.add(f); await dig(p); await dig(p.up()); await moveTo(p); for (const o of scan('*_ore', 4)) log('矿', o.name, o.pos); if (hp() < 10) return {stop: '血少', i} } return {dug: i}`, {
+    name: { type: 'string', description: '[admin]角色名' }, code: { type: 'string', description: '脚本源码 (async 函数体)' },
+    args: { description: '传给脚本的参数 (脚本里的全局 args)' }, timeoutSec: { type: 'number', description: '默认 300, 最大 1800' },
+  }, ['code']),
+  tool('script_status', '查看脚本进度 (不等待): 状态/当前子动作/progress/新日志/统计。since=上次返回的 log_seq 只拿新日志; 不传 id 看最近的脚本', { name: { type: 'string', description: '[admin]角色名' }, id: { type: 'number' }, since: { type: 'number' } }),
+  tool('stop_script', '中止脚本 (正在执行的子动作一并取消), 返回最终报告; 不传 id 中止最近的脚本', { name: { type: 'string', description: '[admin]角色名' }, id: { type: 'number' }, reason: { type: 'string' } }),
   tool('wait_event', '空闲时用: 挂起直到有人给你发消息 (私聊/公屏/动作) 或你死亡, 返回这些消息 (已有未读则立即返回); 超时返回 {timeout:true}。比反复 read_chat 省调用', { name: { type: 'string', description: '[admin]角色名' }, timeoutMs: { type: 'number', description: '默认 60000, 最大 180000' } }),
   tool('get_block', '查询方块 (x,y,z) + 该列最高方块', { name: { type: 'string', description: '[admin]角色名' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, ['x', 'y', 'z']),
   tool('find_block', '在已加载区块中查找方块 (如 oak_log/chest), 返回最近的 5 个', { name: { type: 'string', description: '[admin]角色名' }, block: { type: 'string' }, radius: { type: 'number' } }, ['block']),
@@ -233,7 +327,9 @@ function toolsFor (role: Role): Tool[] {
 }
 
 function txt (t: string) { return { content: [{ type: 'text' as const, text: t }] } }
-function img (buf: Buffer) { return { content: [{ type: 'image' as const, data: buf.toString('base64'), mimeType: 'image/png' }] } }
+function img (buf: Buffer, text?: string) {
+  return { content: [{ type: 'image' as const, data: buf.toString('base64'), mimeType: 'image/png' }, ...(text ? [{ type: 'text' as const, text }] : [])] }
+}
 
 /** 解析工具的目标角色: agent token 固定自身; admin 必须显式传 name */
 async function resolveAgent (role: Role, args: any): Promise<BotAgent> {
@@ -262,20 +358,12 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
   switch (toolName) {
     case 'get_scene': return txt(JSON.stringify(scene(bot), null, 2))
     case 'get_view': {
-      const png = renderView(bot.world, { x: bot.pos.x, y: bot.pos.y + 1.62, z: bot.pos.z }, bot.yaw, bot.pitch, {
-        width: Number(args.width ?? 160), height: Number(args.height ?? 90), fovDeg: Number(args.fov ?? 70),
-        entities: bot.world.nearbyEntities(bot.pos.x, bot.pos.y, bot.pos.z, 40)
-          .map(e => ({ x: e.x, y: e.y, z: e.z, type: e.type, hostile: isHostile(e.type) })),
-      })
-      return img(await pngBuffer(png))
+      const v = await viewTool(bot, args.width === undefined ? undefined : Number(args.width), args.height === undefined ? undefined : Number(args.height), args.fov === undefined ? undefined : Number(args.fov))
+      return img(v.buf, v.text)
     }
     case 'get_map': {
-      const png = renderMap(bot.world, { x: bot.pos.x, z: bot.pos.z }, {
-        radius: Number(args.radius ?? 32), scale: Number(args.scale ?? 4),
-        entities: bot.world.nearbyEntities(bot.pos.x, bot.pos.y, bot.pos.z, 64).map(e => ({ x: e.x, z: e.z, color: entityColor(e.type) })),
-        self: { x: bot.pos.x, z: bot.pos.z },
-      })
-      return img(await pngBuffer(png))
+      const m = await mapTool(bot, args.radius === undefined ? undefined : Number(args.radius), args.scale === undefined ? undefined : Number(args.scale), args.mode === undefined ? undefined : String(args.mode))
+      return img(m.buf, m.text)
     }
     case 'read_chat': {
       const msgs = bot.readChat(Number(args.since ?? 0))
@@ -315,13 +403,27 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
       const a = bot.act(String(args.type), body)
       return txt(JSON.stringify({ actionId: a.id, type: a.type, status: a.status, detail: a.detail }))
     }
+    case 'run_script': {
+      const a = bot.act('script', { code: String(args.code ?? ''), args: args.args, timeoutMs: args.timeoutSec != null ? Number(args.timeoutSec) * 1000 : undefined })
+      return txt(JSON.stringify({ scriptId: a.id, status: a.status, ...(a.detail ? { detail: a.detail } : {}), hint: 'wait_action{actionId} 等结束拿报告, script_status 看进度, stop_script 中止' }))
+    }
+    case 'script_status': case 'stop_script': {
+      const s = findScript(bot, args.id)
+      if (!s) return txt(JSON.stringify({ error: args.id ? `没有脚本 #${args.id}` : '还没运行过脚本' }))
+      if (toolName === 'stop_script') {
+        if (s.status === 'running') s.cancel(`被中止${args.reason ? ': ' + String(args.reason).slice(0, 100) : ''}`)
+        await new Promise(r => setTimeout(r, 120)) // 等子动作收尾
+        return txt(JSON.stringify(s.report(0, 20)))
+      }
+      return txt(JSON.stringify(s.report(Number(args.since ?? 0))))
+    }
     case 'wait_action': {
       const timeoutMs = Math.min(180_000, Number(args.timeoutMs ?? 30_000))
       const interrupt = args.interrupt !== false
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
         const a = args.actionId ? bot.getAction(Number(args.actionId)) : bot.latestAction
-        if (!a || a.status !== 'running') return txt(JSON.stringify(a ? { actionId: a.id, type: a.type, status: a.status, detail: a.detail } : { action: null }))
+        if (!a || a.status !== 'running') return txt(JSON.stringify(a ? actionResult(a) : { action: null }))
         // 有人发消息 → 立即中断等待 (动作本身继续执行), 把消息交给 agent 决策
         if (interrupt && bot.unread().length) {
           await new Promise(r => setTimeout(r, 150))
@@ -354,6 +456,23 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
   }
 }
 
+// ---------- 脚本 ----------
+
+function findScript (bot: BotAgent, id?: any): ScriptAction | null {
+  if (id != null) { const a = bot.getAction(Number(id)); return a instanceof ScriptAction ? a : null }
+  const l = bot.latestAction
+  if (l instanceof ScriptAction) return l
+  let best: ScriptAction | null = null
+  for (const a of bot.actions.values()) if (a instanceof ScriptAction && (!best || a.id > best.id)) best = a
+  return best
+}
+
+/** 动作结束时的返回: 脚本附完整报告 */
+function actionResult (a: Action) {
+  if (a instanceof ScriptAction) return { actionId: a.id, type: a.type, detail: a.detail, ...a.report(0, 40) }
+  return { actionId: a.id, type: a.type, status: a.status, detail: a.detail }
+}
+
 // ---------- 收件箱 ----------
 
 /** 取出全部未读重要消息并标为已读 */
@@ -379,7 +498,7 @@ function withInbox (role: Role, tool: string, args: any, r: any) {
 // ---------- 操作日志 ----------
 
 /** 只读查询类工具: 日志里标为 query, WebUI 默认折叠 */
-const QUERY_TOOLS = new Set(['list_agents', 'get_scene', 'get_view', 'get_map', 'read_chat', 'wait_action', 'wait_event', 'get_block', 'find_block', 'list_inventory', 'get_container'])
+const QUERY_TOOLS = new Set(['list_agents', 'get_scene', 'get_view', 'get_map', 'read_chat', 'wait_action', 'script_status', 'wait_event', 'get_block', 'find_block', 'list_inventory', 'get_container'])
 
 function summarize (r: any): string {
   const c = r?.content?.[0]
@@ -402,12 +521,6 @@ function logCall (role: Role, via: 'mcp' | 'rest', tool: string, args: any, ms: 
   oplog.add(agent, QUERY_TOOLS.has(tool) ? 'query' : 'tool',
     `${tool}${argsText(args) ? ' ' + argsText(args) : ''} → ${error !== undefined ? '错误: ' + error : summarize(result)}`,
     { tool, via, by: role.kind, ms }, failed ? 'warn' : 'info')
-}
-
-function entityColor (type: string): string {
-  if (/(zombie|skeleton|creeper|spider|witch|enderman|phantom|slime|drowned|husk|stray|pillager|vindicator)/.test(type)) return 'ff3b30'
-  if (/(cow|pig|sheep|chicken|horse|wolf|cat|dog|villager|rabbit|fox|bee|goat|frog|camel|sniffer|allay)/.test(type)) return '30b0ff'
-  return 'ffcc00'
 }
 
 // ---------- HTTP 服务 ----------
@@ -455,20 +568,11 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'DELETE') { const was = manager.kill(target, role.kind === 'agent' ? '自行下线' : 'admin'); return json(res, 200, { ok: true, wasOnline: was }) }
       const bot = await manager.ensure(target)
       if (action === 'scene') return json(res, 200, scene(bot))
-      if (action === 'view') {
-        const png = renderView(bot.world, { x: bot.pos.x, y: bot.pos.y + 1.62, z: bot.pos.z }, bot.yaw, bot.pitch, {
-          width: Number(url.searchParams.get('w') ?? 160), height: Number(url.searchParams.get('h') ?? 90), fovDeg: Number(url.searchParams.get('fov') ?? 70),
-          entities: bot.world.nearbyEntities(bot.pos.x, bot.pos.y, bot.pos.z, 40).map(e => ({ x: e.x, y: e.y, z: e.z, type: e.type })),
-        })
-        return pngRes(res, await pngBuffer(png))
-      }
-      if (action === 'map') {
-        const png = renderMap(bot.world, { x: bot.pos.x, z: bot.pos.z }, {
-          radius: Number(url.searchParams.get('r') ?? 32), scale: Number(url.searchParams.get('s') ?? 4),
-          entities: bot.world.nearbyEntities(bot.pos.x, bot.pos.y, bot.pos.z, 64).map(e => ({ x: e.x, z: e.z, color: entityColor(e.type) })),
-          self: { x: bot.pos.x, z: bot.pos.z },
-        })
-        return pngRes(res, await pngBuffer(png))
+      if (action === 'view' || action === 'map') {
+        const n = (k: string) => url.searchParams.has(k) ? Number(url.searchParams.get(k)) : undefined
+        const r = action === 'view' ? await viewTool(bot, n('w'), n('h'), n('fov')) : await mapTool(bot, n('r'), n('s'), url.searchParams.get('mode') ?? undefined)
+        if (url.searchParams.has('text')) return json(res, 200, { text: r.text })
+        return pngRes(res, r.buf)
       }
       if (action === 'chat' && req.method === 'GET') return json(res, 200, bot.readChat(Number(url.searchParams.get('since') ?? 0)))
       if (action === 'block') return json(res, 200, { block: bot.world.getBlock(Number(url.searchParams.get('x')), Number(url.searchParams.get('y')), Number(url.searchParams.get('z')))?.name ?? null })
@@ -477,7 +581,7 @@ const server = http.createServer(async (req, res) => {
       if (action === 'action' && req.method === 'GET') {
         const id = Number(url.searchParams.get('id') ?? 0)
         const a = id ? bot.getAction(id) : bot.activeAction
-        return json(res, 200, a ? { actionId: a.id, type: a.type, status: a.status, detail: a.detail } : { action: null })
+        return json(res, 200, a ? (a instanceof ScriptAction ? { actionId: a.id, type: a.type, detail: a.detail, ...a.report(Number(url.searchParams.get('since') ?? 0)) } : actionResult(a)) : { action: null })
       }
       if (req.method === 'POST') {
         const body = await readJson(req)

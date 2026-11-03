@@ -93,19 +93,26 @@ export class Reflex {
 
   private get busy () { return !!this.task && this.task.status === 'running' }
 
+  private treading = false
+
   /** 每 tick 调用 (动作 step 之后、物理之前, 可覆盖控制量) */
   tick (now: number) {
     const bot = this.bot
     if (bot.sleeping || bot.vehicleId !== null || bot.health <= 0) return
     const p = this.policy
-    const head = bot.world.getBlock(Math.floor(bot.pos.x), Math.floor(bot.pos.y + 1.62), Math.floor(bot.pos.z))?.name
+    const head = bot.world.getBlock(Math.floor(bot.pos.x), Math.floor(bot.pos.y + bot.eyeHeight), Math.floor(bot.pos.z))?.name
     const feet = bot.world.getBlock(Math.floor(bot.pos.x), Math.floor(bot.pos.y), Math.floor(bot.pos.z))?.name
 
     // 溺水: 头在水里且氧气见底 → 按住跳往上游 (每 tick 覆盖控制量)
     if (p.avoidHazards && isWatery(head) && bot.air < 150) bot.physics.control.jump = true
     // 空闲泡在水里: 踩水浮在水面 (否则会沉到水底)
     const prim = bot.activeAction
-    if (isWatery(feet) && (!prim || prim.status !== 'running')) bot.physics.control.jump = true
+    if (isWatery(feet) && (!prim || prim.status !== 'running')) { bot.physics.control.jump = true; this.treading = true }
+    else if (this.treading) {
+      // 离开水面 (上岸/被传送) 后松开跳跃, 否则空闲时会原地一直跳
+      this.treading = false
+      if (!prim || prim.status !== 'running') bot.physics.control.jump = false
+    }
 
     // 逃离危险地形进行中: 每 tick 朝安全点冲 (前进+疾跑+跳; 岩浆里跳有上浮)
     if (this.escape) {
