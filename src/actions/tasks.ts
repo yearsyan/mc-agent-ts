@@ -87,7 +87,7 @@ async function reachBlock (act: AsyncAction & { subMove: (t: any, o?: any) => Pr
 }
 
 /** 带 subMove 的任务基类 */
-abstract class Task extends AsyncAction {
+export abstract class Task extends AsyncAction {
   async subMove (t: { x: number, y?: number, z: number }, opts: { tolerance?: number, timeoutMs?: number } = {}) {
     return this.sub(new MoveToAction(this.bot, t, opts))
   }
@@ -330,11 +330,13 @@ export class PickupItemsAction extends Task {
     for (;;) {
       if (Date.now() - t0 > this.maxMs) break
       const items = [...bot.world.entities.values()]
-        .filter(e => e.type === 'item' && !skip.has(e.id) && Math.hypot(e.x - c().x, e.z - c().z) <= this.radius && Math.abs(e.y - c().y) <= 6)
+        // 掉落物 + 自己射出、插在地上的箭
+        .filter(e => (e.type === 'item' || (/^(arrow|spectral_arrow)$/.test(e.type) && e.ownerId === bot.entityId && e.meta.in_ground)) && !skip.has(e.id) && Math.hypot(e.x - c().x, e.z - c().z) <= this.radius && Math.abs(e.y - c().y) <= 6)
         .sort((a, b) => Math.hypot(a.x - bot.pos.x, a.z - bot.pos.z) - Math.hypot(b.x - bot.pos.x, b.z - bot.pos.z))
       if (!items.length) break
       const e = items[0]
-      if (bot.inventory.emptySlots() === 0 && !bot.inventory.find(s => s.name === e.item && s.count < 64).length) { skip.add(e.id); continue }
+      const itemName = e.type === 'item' ? e.item : 'arrow'
+      if (bot.inventory.emptySlots() === 0 && !bot.inventory.find(s => s.name === itemName && s.count < 64).length) { skip.add(e.id); continue }
       const mv = await this.subMove({ x: e.x, y: Math.floor(e.y + 0.2), z: e.z }, { tolerance: 0, timeoutMs: 15_000 })
       if (mv.status !== 'done') { miss(e.id); continue }
       // 走到了: 等一下拾取; 还在就记一次未命中
@@ -432,6 +434,7 @@ export async function eatOnce (act: AsyncAction, bot: BotAgent, item?: string): 
     const prev = bot.inventory.heldSlot
     await holdSlot(act, bot, hit.slot)
     const food0 = bot.food
+    bot.usingHand = 'main_hand'
     bot.useItem()
     // 吃东西 32 tick; 服务器在使用结束时自动生效, 期间不能切换手持
     await act.until(() => bot.food > food0, 3000, '进食生效')
@@ -439,6 +442,7 @@ export async function eatOnce (act: AsyncAction, bot: BotAgent, item?: string): 
     if (bot.inventory.heldSlot !== prev) bot.selectSlot(prev)
     return `吃了 ${hit.item.name} (饱食 ${food0}→${bot.food})`
   } finally {
+    if (bot.usingHand === 'main_hand') bot.usingHand = null
     bot.releaseHand(owner)
   }
 }

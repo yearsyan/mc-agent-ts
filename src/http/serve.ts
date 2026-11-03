@@ -153,6 +153,7 @@ function scene (bot: BotAgent) {
     ...(bot.air < 300 ? { air: bot.air } : {}),
     ...(bot.onFire ? { on_fire: true } : {}),
     inventory: bot.inventory.summary(),
+    combat: { hits_taken: bot.hurts, shield_blocks: bot.shieldBlocks, ...(bot.reflex.shieldUp ? { shield_up: true } : {}), ...(bot.onCooldown('shield') ? { shield_disabled_s: Math.ceil(((bot.cooldowns.get('shield') ?? 0) - Date.now()) / 1000) } : {}) },
     reflex: bot.reflex.status(),
     standing_on: below?.name ?? '未知(chunk未加载)',
     looking_at: looking ? { block: looking.name, x: looking.x, y: looking.y, z: looking.z, distance: +looking.dist.toFixed(1) } : null,
@@ -175,7 +176,7 @@ const TOOLS: Tool[] = [
   tool('get_scene', '场景: 位置/朝向/血量/脚下方块/准星指向/附近实体(id/类型/方位/距离)', { name: { type: 'string', description: '[admin]角色名' } }),
   tool('get_view', '第一人称合成视觉 PNG (含实体叠加: 红=敌对 蓝=动物 黄=掉落物)', { name: { type: 'string', description: '[admin]角色名' }, width: { type: 'number' }, height: { type: 'number' }, fov: { type: 'number', description: '水平FOV度' } }),
   tool('get_map', '顶视地图 PNG (红点=自己, 实体色点)', { name: { type: 'string', description: '[admin]角色名' }, radius: { type: 'number' }, scale: { type: 'number' } }),
-  tool('read_chat', '读聊天消息 (seq 递增可增量拉取)', { name: { type: 'string', description: '[admin]角色名' }, since: { type: 'number' } }),
+  tool('read_chat', '读聊天消息 (seq 递增可增量拉取; 读过即标为已读)。其他工具的返回末尾出现 {inbox} 表示有人给你发了消息还没看', { name: { type: 'string', description: '[admin]角色名' }, since: { type: 'number' } }),
   tool('say', '游戏内聊天发言 (不执行命令)', { name: { type: 'string', description: '[admin]角色名' }, text: { type: 'string' } }, ['text']),
   tool('run_command', '以本角色身份执行服务器命令 (如 /seed /list /msg; 可加可不加 "/")。权限由服务器决定 (bot 不是 OP 时管理命令会被拒, 结果里附可用命令列表)。返回服务器回给你的消息', {
     name: { type: 'string', description: '[admin]角色名' }, command: { type: 'string' }, waitMs: { type: 'number', description: '等回复的最长毫秒数, 默认 2000' },
@@ -188,26 +189,29 @@ const TOOLS: Tool[] = [
 合成: craft{item,count?} (任意配方; 3×3 自动找/放工作台) | smelt{item,count?,fuel?} (自动找/放熔炉)
 物品: equip{item} (工具→手上, 盔甲→身上, 盾→副手) | eat{item?} | use_item{item?,hold_ms?} | select_slot{slot 0-8} | drop_item{slot,all}
 交互: use_block{x,y,z,item?} (门/拉杆/按钮等) | sleep{x?,y?,z?} | wake | interact_entity{entity_id,item?} (喂食繁殖/剪毛/骑乘) | dismount | trade{entity_id,index?,times?} (不给 index 返回交易列表)
-战斗: attack{entity_id,hits?} (自动换最好的武器)
+战斗: attack{entity_id,hits?} (自动换最好的武器) | shoot{entity_id,shots?,pickup?} (弓箭自动瞄准: 弹道+移动预判, 隔墙/会误伤时不射, 贴脸自动近战, 打完捡回箭)
 容器: open_container{x,y,z} | chest_take{slot} | chest_put{slot} | close_window
 死亡: 死亡时所有动作以"死亡: 死因"取消, scene.last_death 给出死因/地点/掉落物剩余时间, 聊天里也有提示; respawn (仅 autoRespawn=false 时需要)`, {
     name: { type: 'string', description: '[admin]角色名' },
-    type: { type: 'string', enum: ['move_to', 'go_home', 'jump', 'stop', 'collect', 'dig', 'pickup_items', 'place', 'craft', 'smelt', 'equip', 'eat', 'use_item', 'select_slot', 'drop_item', 'use_block', 'sleep', 'wake', 'interact_entity', 'mount', 'dismount', 'trade', 'attack', 'open_container', 'chest_take', 'chest_put', 'close_window', 'respawn', 'craft_planks'] },
+    type: { type: 'string', enum: ['move_to', 'go_home', 'jump', 'stop', 'collect', 'dig', 'pickup_items', 'place', 'craft', 'smelt', 'equip', 'eat', 'use_item', 'select_slot', 'drop_item', 'use_block', 'sleep', 'wake', 'interact_entity', 'mount', 'dismount', 'trade', 'attack', 'shoot', 'open_container', 'chest_take', 'chest_put', 'close_window', 'respawn', 'craft_planks'] },
     x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, face: { type: 'number' }, tolerance: { type: 'number', description: 'move_to 到达容差, 0=精确' },
     item: { type: 'string', description: '物品名, 如 oak_planks / wooden_pickaxe / bread' }, block: { type: 'string', description: '方块名, 如 oak_log / stone / iron_ore' },
     count: { type: 'number' }, radius: { type: 'number' }, fuel: { type: 'string' },
-    entity_id: { type: 'number' }, hits: { type: 'number' }, hotbar: { type: 'number' }, slot: { type: 'number' }, all: { type: 'boolean' },
+    entity_id: { type: 'number' }, hits: { type: 'number' }, shots: { type: 'number', description: 'shoot 最多射几箭, 默认 5' }, pickup: { type: 'boolean', description: 'shoot 后是否捡回箭, 默认 true' }, hotbar: { type: 'number' }, slot: { type: 'number' }, all: { type: 'boolean' },
     index: { type: 'number', description: 'trade 的交易序号' }, times: { type: 'number' }, hold_ms: { type: 'number' },
   }, ['type']),
   tool('set_policy', `设置反射策略 (bot 自主执行, 不等你决策; 只传要改的字段):
 autoEat(bool) 自动进食 | eatAt(饱食度阈值, 默认 14) | combat: defend(还击, 默认)/flee(见怪就跑)/ignore | fleeHealth(血量低于此值逃跑, 默认 8)
 avoidHazards(bool) 逃离岩浆/火/溺水 | nightShelter(bool) 天黑空闲时回家睡觉 | home: "here" 或 {x,y,z} 或 null
-autoRespawn(bool) 死亡后自动复活 (默认 true; false 则停在死亡界面等 act respawn)`, {
+autoRespawn(bool) 死亡后自动复活 (默认 true; false 则停在死亡界面等 act respawn)
+shield(bool) 自动举盾 (默认 true; 副手空着会自动放上盾): 箭飞来/骷髅拉弓/苦力怕点燃/怪近身时面向威胁格挡, 砍怪时放下
+ranged: auto(默认, 有弓有箭时远程怪/苦力怕/飞行怪用弓, 空闲时也射逼近的怪)/never`, {
     name: { type: 'string', description: '[admin]角色名' },
     autoEat: { type: 'boolean' }, eatAt: { type: 'number' }, combat: { type: 'string', enum: ['defend', 'flee', 'ignore'] }, fleeHealth: { type: 'number' },
-    avoidHazards: { type: 'boolean' }, nightShelter: { type: 'boolean' }, autoRespawn: { type: 'boolean' }, home: { description: '"here" | {x,y,z} | null' },
+    avoidHazards: { type: 'boolean' }, nightShelter: { type: 'boolean' }, autoRespawn: { type: 'boolean' }, shield: { type: 'boolean' }, ranged: { type: 'string', enum: ['auto', 'never'] }, home: { description: '"here" | {x,y,z} | null' },
   }),
-  tool('wait_action', '等待动作完成', { name: { type: 'string', description: '[admin]角色名' }, actionId: { type: 'number' }, timeoutMs: { type: 'number' } }),
+  tool('wait_action', '等待动作完成。有人给你发消息 (私聊/聊天) 或你死亡时会立即中断等待并返回消息 (interrupted:true, 动作继续执行); interrupt:false 关闭中断', { name: { type: 'string', description: '[admin]角色名' }, actionId: { type: 'number' }, timeoutMs: { type: 'number' }, interrupt: { type: 'boolean', description: '默认 true' } }),
+  tool('wait_event', '空闲时用: 挂起直到有人给你发消息 (私聊/公屏/动作) 或你死亡, 返回这些消息 (已有未读则立即返回); 超时返回 {timeout:true}。比反复 read_chat 省调用', { name: { type: 'string', description: '[admin]角色名' }, timeoutMs: { type: 'number', description: '默认 60000, 最大 180000' } }),
   tool('get_block', '查询方块 (x,y,z) + 该列最高方块', { name: { type: 'string', description: '[admin]角色名' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } }, ['x', 'y', 'z']),
   tool('find_block', '在已加载区块中查找方块 (如 oak_log/chest), 返回最近的 5 个', { name: { type: 'string', description: '[admin]角色名' }, block: { type: 'string' }, radius: { type: 'number' } }, ['block']),
   tool('list_inventory', '库存 (9-35背包 36-44快捷栏)', { name: { type: 'string', description: '[admin]角色名' } }),
@@ -273,7 +277,19 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
       })
       return img(await pngBuffer(png))
     }
-    case 'read_chat': return txt(JSON.stringify(bot.readChat(Number(args.since ?? 0))))
+    case 'read_chat': {
+      const msgs = bot.readChat(Number(args.since ?? 0))
+      if (msgs.length) bot.markRead(msgs[msgs.length - 1].seq)
+      return txt(JSON.stringify(msgs))
+    }
+    case 'wait_event': {
+      // 长轮询: 有未读重要消息立即返回, 否则挂起直到来消息或超时
+      const timeoutMs = Math.max(500, Math.min(180_000, Number(args.timeoutMs ?? 60_000)))
+      const got = await bot.waitImportant(timeoutMs)
+      if (!got) return txt(JSON.stringify({ timeout: true, waited_ms: timeoutMs }))
+      await new Promise(r => setTimeout(r, 150)) // 同一批消息 (如私聊+系统提示) 往往紧挨着到, 稍等收齐
+      return txt(JSON.stringify({ events: takeUnread(bot) }))
+    }
     case 'say': {
       const t = String(args.text ?? '')
       if (t.startsWith('/')) return txt(JSON.stringify({ ok: false, error: 'say 只发聊天, 执行命令请用 run_command' }))
@@ -282,9 +298,10 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
     case 'run_command': return txt(JSON.stringify(await bot.runCommand(String(args.command ?? ''), Math.max(300, Math.min(10_000, Number(args.waitMs ?? 2000)))), null, 1))
     case 'set_policy': {
       const p: any = { ...bot.reflex.policy }
-      for (const k of ['autoEat', 'avoidHazards', 'nightShelter', 'autoRespawn']) if (typeof args[k] === 'boolean') p[k] = args[k]
+      for (const k of ['autoEat', 'avoidHazards', 'nightShelter', 'autoRespawn', 'shield']) if (typeof args[k] === 'boolean') p[k] = args[k]
       for (const k of ['eatAt', 'fleeHealth']) if (args[k] !== undefined && Number.isFinite(Number(args[k]))) p[k] = Math.max(0, Math.min(20, Number(args[k])))
       if (['defend', 'flee', 'ignore'].includes(args.combat)) p.combat = args.combat
+      if (['auto', 'never'].includes(args.ranged)) p.ranged = args.ranged
       if (args.home === 'here') p.home = { x: Math.floor(bot.pos.x), y: Math.floor(bot.pos.y), z: Math.floor(bot.pos.z) }
       else if (args.home === null) p.home = null
       else if (args.home && typeof args.home === 'object') p.home = { x: Math.floor(Number(args.home.x)), y: Math.floor(Number(args.home.y)), z: Math.floor(Number(args.home.z)) }
@@ -300,13 +317,22 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
     }
     case 'wait_action': {
       const timeoutMs = Math.min(180_000, Number(args.timeoutMs ?? 30_000))
+      const interrupt = args.interrupt !== false
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
         const a = args.actionId ? bot.getAction(Number(args.actionId)) : bot.latestAction
         if (!a || a.status !== 'running') return txt(JSON.stringify(a ? { actionId: a.id, type: a.type, status: a.status, detail: a.detail } : { action: null }))
-        await new Promise(ok => setTimeout(ok, 400))
+        // 有人发消息 → 立即中断等待 (动作本身继续执行), 把消息交给 agent 决策
+        if (interrupt && bot.unread().length) {
+          await new Promise(r => setTimeout(r, 150))
+          return txt(JSON.stringify({ actionId: a.id, type: a.type, status: 'running', interrupted: true, events: takeUnread(bot),
+            hint: '等待因新消息中断, 动作仍在执行; 处理完可再次 wait_action 继续等 (或 act stop 停下)' }))
+        }
+        if (interrupt) await bot.waitImportant(Math.min(400, deadline - Date.now()))
+        else await new Promise(ok => setTimeout(ok, 400))
       }
-      return txt(JSON.stringify({ timeout: true }))
+      const a = args.actionId ? bot.getAction(Number(args.actionId)) : bot.latestAction
+      return txt(JSON.stringify({ timeout: true, ...(a ? { actionId: a.id, status: a.status } : {}) }))
     }
     case 'get_block': {
       const x = Math.floor(Number(args.x)), y = Math.floor(Number(args.y)), z = Math.floor(Number(args.z))
@@ -328,10 +354,32 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
   }
 }
 
+// ---------- 收件箱 ----------
+
+/** 取出全部未读重要消息并标为已读 */
+function takeUnread (bot: BotAgent) {
+  const u = bot.unread()
+  if (u.length) bot.markRead(u[u.length - 1].seq)
+  return u.map(m => ({ seq: m.seq, kind: m.kind, text: m.text, ...(m.key ? { key: m.key } : {}), ago_s: Math.round((Date.now() - m.at) / 1000) }))
+}
+
+/** 不直接返回消息的工具: 结果末尾附加未读提醒 (不标已读, 直到 read_chat/wait_event 看过) */
+const NO_INBOX = new Set(['read_chat', 'wait_event', 'list_agents', 'spawn_agent', 'kill_agent'])
+function withInbox (role: Role, tool: string, args: any, r: any) {
+  if (NO_INBOX.has(tool) || !r?.content) return r
+  const name = role.kind === 'agent' ? role.name : String(args?.name ?? '')
+  const bot = name ? manager.agents.get(name) : undefined
+  if (!bot || bot.phase !== 'play') return r
+  const u = bot.unread()
+  if (!u.length) return r
+  const inbox = { unread: u.length, latest: u.slice(-3).map(m => m.text), hint: `read_chat since=${bot.chatReadSeq} 查看并标为已读` }
+  return { ...r, content: [...r.content, { type: 'text', text: JSON.stringify({ inbox }) }] }
+}
+
 // ---------- 操作日志 ----------
 
 /** 只读查询类工具: 日志里标为 query, WebUI 默认折叠 */
-const QUERY_TOOLS = new Set(['list_agents', 'get_scene', 'get_view', 'get_map', 'read_chat', 'wait_action', 'get_block', 'find_block', 'list_inventory', 'get_container'])
+const QUERY_TOOLS = new Set(['list_agents', 'get_scene', 'get_view', 'get_map', 'read_chat', 'wait_action', 'wait_event', 'get_block', 'find_block', 'list_inventory', 'get_container'])
 
 function summarize (r: any): string {
   const c = r?.content?.[0]
@@ -470,7 +518,7 @@ async function handleMcpRequest (role: Role, req: http.IncomingMessage, res: htt
     const { name, arguments: args = {} } = req2.params
     const t0 = Date.now()
     try {
-      const r = await handleTool(role, name, args)
+      const r = withInbox(role, name, args, await handleTool(role, name, args))
       logCall(role, 'mcp', name, args, Date.now() - t0, r)
       return r
     } catch (e: any) {

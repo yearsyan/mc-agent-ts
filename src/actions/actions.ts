@@ -510,6 +510,7 @@ export class AttackAction extends AsyncAction {
       const dist = Math.hypot(e.x - bot.pos.x, e.y + 0.9 - (bot.pos.y + 1.62), e.z - bot.pos.z)
       if (dist > 3.6) { if (!hits) throw new Error(`距离 ${dist.toFixed(1)} 太远 (需 ≤3.5)`); return `攻击 ${hits} 次后目标离开触及范围` }
       faceTowards(bot, e.x, e.y + 0.9, e.z)
+      bot.reflex.lowerShield() // 举着盾不能攻击
       bot.client.write('attack', { entityId: this.entityId }) // 26.3: 攻击是独立的 attack 包
       bot.client.write('arm_animation', { hand: 'main_hand' })
       hits++

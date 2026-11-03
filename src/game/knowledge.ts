@@ -137,6 +137,19 @@ export const isRanged = (type: string) => RANGED.has(type)
 const PASSIVE = /(cow|pig|sheep|chicken|horse|donkey|mule|llama|wolf|cat|ocelot|villager|rabbit|fox|bee|goat|frog|camel|sniffer|allay|parrot|turtle|axolotl|armadillo|mooshroom|panda|strider)/
 export const isPassive = (type: string) => PASSIVE.test(type) && !HOSTILE.has(type)
 
+/** 会飞的 (射击预判要算垂直速度) */
+export const FLYING = new Set(['phantom', 'ghast', 'blaze', 'vex', 'bat', 'bee', 'parrot', 'allay', 'breeze', 'wither', 'ender_dragon'])
+/** 弹射物实体 (盾牌要挡的) */
+export const isProjectile = (type: string) => /^(arrow|spectral_arrow|trident|fireball|small_fireball|dragon_fireball|wither_skull|wind_charge|breeze_wind_charge|llama_spit|shulker_bullet|snowball|egg|splash_potion|lingering_potion)$/.test(type)
+/** 不挡箭、也不怕误伤的实体 (掉落物/经验球/弹射物/标记类) */
+export const isIgnorableEntity = (type: string) => isProjectile(type) || /^(item|experience_orb|area_effect_cloud|marker|interaction|.*_display|lightning_bolt|falling_block|tnt|firework_rocket|fishing_bobber|eye_of_ender|ender_pearl|evoker_fangs|leash_knot|painting|item_frame|glow_item_frame)$/.test(type)
+export const ARROW_ITEMS = ['arrow', 'spectral_arrow', 'tipped_arrow']
+/** 实体碰撞箱 (格) */
+export function entitySize (type: string): { w: number, h: number } {
+  const e = mcData.entitiesByName[type]
+  return { w: e?.width ?? 0.6, h: e?.height ?? 1.8 }
+}
+
 // ---------- 液体 ----------
 
 /** 含水方块: 海带/海草/气泡柱所在格本身充满水, 游泳/溺水判断时都按水处理 */

@@ -21,6 +21,22 @@ export interface TrackedEntity {
   /** 掉落物实体的物品 (entity_metadata 下发) */
   item?: string
   itemCount?: number
+  /** 由位置更新估算的速度 (格/tick, 指数平滑); 长时间没更新视为静止, 用 entityVelocity() 读 */
+  vx: number
+  vy: number
+  vz: number
+  /** 服务器下发的速度 (spawn_entity / entity_velocity, 格/tick) 及时间; 弹射物主要靠它 */
+  sv?: { x: number, y: number, z: number, at: number }
+  /** 弹射物的发射者 (spawn_entity.objectData) */
+  ownerId?: number
+  /** 实体元数据 (按 minecraft-data metadataKeys 命名, 如 living_entity_flags / swell_dir / in_ground) */
+  meta: Record<string, any>
+}
+
+/** 实体当前速度 (格/tick): 位置更新 300ms 内用估算值, 否则视为静止 (服务器只在移动时发更新) */
+export function entityVelocity (e: TrackedEntity, now = Date.now()) {
+  if (now - e.lastUpdate > 300) return { x: 0, y: 0, z: 0 }
+  return { x: e.vx, y: e.vy, z: e.vz }
 }
 
 const AIR = new Set(['air', 'cave_air', 'void_air'])
@@ -195,27 +211,63 @@ export class World {
 
   trackSpawn (p: any) {
     const t = this.entityNameById.get(p.type ?? p.entityType ?? -1) ?? `type_${p.type ?? '?'}`
+    const v = p.velocity
     this.entities.set(p.entityId, {
       id: p.entityId, type: t,
       x: p.x, y: p.y, z: p.z,
       firstSeen: Date.now(), lastUpdate: Date.now(),
+      vx: v?.x ?? 0, vy: v?.y ?? 0, vz: v?.z ?? 0,
+      ...(v ? { sv: { x: v.x, y: v.y, z: v.z, at: Date.now() } } : {}),
+      ...(/arrow|trident|fireball|spit|bullet|charge|potion|snowball|egg/.test(t) && p.objectData > 0 ? { ownerId: p.objectData } : {}), // 26.3: objectData 就是发射者实体 id
+      meta: {},
     })
+  }
+
+  /** 位置变化 → 更新平滑速度 */
+  private observeMove (e: TrackedEntity, nx: number, ny: number, nz: number) {
+    const now = Date.now()
+    const dt = Math.max(1, Math.round((now - e.lastUpdate) / 50)) // tick
+    const a = now - e.lastUpdate > 300 ? 1 : 0.5 // 停了一阵再动: 直接取新值
+    if (dt <= 10) {
+      e.vx += a * ((nx - e.x) / dt - e.vx)
+      e.vy += a * ((ny - e.y) / dt - e.vy)
+      e.vz += a * ((nz - e.z) / dt - e.vz)
+    }
+    e.x = nx; e.y = ny; e.z = nz
+    e.lastUpdate = now
+  }
+
+  /** 弹射物被弹开 (速度反向且骤减, 典型是被盾挡下: 原版 deflect 速度 ×-0.1) */
+  onDeflect?: (e: TrackedEntity) => void
+
+  setEntityVelocity (entityId: number, v: { x: number, y: number, z: number }) {
+    const e = this.entities.get(entityId)
+    if (!e) return
+    const prev = e.sv
+    e.sv = { x: v.x, y: v.y, z: v.z, at: Date.now() }
+    if (prev && /arrow|trident/.test(e.type)) {
+      const p0 = Math.hypot(prev.x, prev.y, prev.z), p1 = Math.hypot(v.x, v.y, v.z)
+      if (p0 > 0.5 && p1 > 0.02 && p1 < p0 * 0.4 && prev.x * v.x + prev.z * v.z < 0) this.onDeflect?.(e)
+    }
+  }
+
+  setEntityMeta (entityId: number, key: number, value: any) {
+    const e = this.entities.get(entityId)
+    if (!e) return
+    const keys: string[] | undefined = mcData.entitiesByName[e.type]?.metadataKeys
+    e.meta[keys?.[key] ?? String(key)] = value
   }
 
   trackMove (entityId: number, dx: number, dy: number, dz: number) {
     const e = this.entities.get(entityId)
     if (!e) return
-    e.x += dx / 4096
-    e.y += dy / 4096
-    e.z += dz / 4096
-    e.lastUpdate = Date.now()
+    this.observeMove(e, e.x + dx / 4096, e.y + dy / 4096, e.z + dz / 4096)
   }
 
   trackTeleport (entityId: number, x: number, y: number, z: number) {
     const e = this.entities.get(entityId)
     if (!e) return
-    e.x = x; e.y = y; e.z = z
-    e.lastUpdate = Date.now()
+    this.observeMove(e, x, y, z)
   }
 
   setEntityItem (entityId: number, item: string, count: number) {

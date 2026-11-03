@@ -13,6 +13,7 @@ import { Inventory } from './inventory.js'
 import { Action, MoveToAction, DigAction, PlaceAction, AttackAction, JumpAction, StopAction, SelectSlotAction, OpenContainerAction, ChestOpAction, DropItemAction, CloseWindowAction } from '../actions/actions.js'
 import { CraftAction, SmeltAction, CollectAction, PickupItemsAction, EquipAction, EatAction, UseItemAction, UseBlockAction, SleepAction, WakeAction, InteractEntityAction, DismountAction, TradeAction } from '../actions/tasks.js'
 import { Reflex } from './reflex.js'
+import { ShootAction } from '../actions/combat.js'
 import { itemName } from '../game/knowledge.js'
 import type { ChatMessage } from './types.js'
 import { AsyncAction } from '../actions/base.js'
@@ -85,6 +86,18 @@ export class BotAgent {
   lastDamage: { at: number, attackerId: number | null, sourceType: number, sourceName: string | null } | null = null
   /** 累计捡起的物品数 (collect 包) */
   pickedUp = 0
+  /** 各实体最近一次受伤时间 (damage_event; 射箭判定命中用) */
+  entityDamagedAt = new Map<number, number>()
+  /** 物品冷却 (set_cooldown: 组名 → 结束时间), 如盾被斧头打掉后 minecraft:shield 冷却 5s */
+  cooldowns = new Map<string, number>()
+  /** 盾牌成功格挡次数 (自身 entity_status 29) / 最近一次格挡时间 */
+  shieldBlocks = 0
+  lastShieldBlockAt = 0
+  /** 本次上线累计受伤次数 (自身 damage_event) */
+  hurts = 0
+  /** 正在使用的物品手 (拉弓/举盾/进食), 由发起方维护 */
+  usingHand: 'main_hand' | 'off_hand' | null = null
+  private afterTickFns: Array<() => void> = []
   /** 实体最近的状态事件 (如动物繁殖爱心 = 18) */
   entityStatus = new Map<number, { status: number, at: number }>()
   /** 当前打开的村民交易列表 (trade_list) */
@@ -214,7 +227,10 @@ export class BotAgent {
         if (clock) this.dayTime = Number(clock.totalTicks) % 24000
       })
       client.on('damage_event', (p: any) => {
+        this.entityDamagedAt.set(p.entityId, Date.now())
+        if (this.entityDamagedAt.size > 500) this.entityDamagedAt.clear()
         if (p.entityId !== this.entityId) return
+        this.hurts++
         // sourceCauseId/sourceDirectId 是 "实体 id + 1", 0 表示无
         this.lastDamage = { at: Date.now(), attackerId: p.sourceCauseId > 0 ? p.sourceCauseId - 1 : (p.sourceDirectId > 0 ? p.sourceDirectId - 1 : null), sourceType: p.sourceTypeId, sourceName: this.damageTypes[p.sourceTypeId] ?? null }
       })
@@ -226,6 +242,8 @@ export class BotAgent {
             else if (m.key === 6) this.sleeping = m.value === 'sleeping' || m.value === 2
           } else if (m.key === 8 && m.value && typeof m.value === 'object' && m.value.itemId !== undefined) {
             this.world.setEntityItem(p.entityId, itemName(m.value.itemId), m.value.itemCount ?? 1) // 掉落物实体的物品
+          } else if (typeof m.value !== 'object' || m.value === null) {
+            this.world.setEntityMeta(p.entityId, m.key, m.value) // 拉弓 (living_entity_flags) / 苦力怕膨胀 (swell_dir) / 箭插地 (in_ground) 等
           }
         }
       })
@@ -234,7 +252,18 @@ export class BotAgent {
         if (ids.includes(this.entityId)) this.vehicleId = p.entityId
         else if (this.vehicleId === p.entityId) { this.vehicleId = null; this.physics.syncFromBot() }
       })
-      ;(client as any).on('entity_status', (p: any) => this.entityStatus.set(p.entityId, { status: p.entityStatus, at: Date.now() }))
+      ;(client as any).on('entity_status', (p: any) => {
+        this.entityStatus.set(p.entityId, { status: p.entityStatus, at: Date.now() })
+        if (p.entityId === this.entityId && p.entityStatus === 29) { this.shieldBlocks++; this.lastShieldBlockAt = Date.now() } // 盾牌格挡
+        if (p.entityId === this.entityId && p.entityStatus === 30) { this.usingHand = this.usingHand === 'off_hand' ? null : this.usingHand } // 盾被击破
+      })
+      client.on('entity_velocity', (p: any) => { if (p.velocity) this.world.setEntityVelocity(p.entityId, p.velocity) })
+      // 26.3 盾牌格挡不再发 entity_status 29; 改用"举盾时别人的箭被弹开"计数
+      this.world.onDeflect = (e) => { if (this.usingHand === 'off_hand' && e.ownerId !== this.entityId) { this.shieldBlocks++; this.lastShieldBlockAt = Date.now() } }
+      client.on('set_cooldown', (p: any) => {
+        const g = String(p.cooldownGroup).replace(/^minecraft:/, '')
+        if (p.cooldownTicks > 0) this.cooldowns.set(g, Date.now() + p.cooldownTicks * 50); else this.cooldowns.delete(g)
+      })
       client.on('collect', (p: any) => { if (p.collectorEntityId === this.entityId) this.pickedUp += p.pickupItemCount ?? 1 })
       client.on('trade_list', (p: any) => { this.trades = p.trades ?? [] })
       client.on('update_health', (p: any) => {
@@ -437,7 +466,14 @@ export class BotAgent {
     } else {
       this.client.write('position', { x: this.pos.x, y: this.pos.y, z: this.pos.z, flags })
     }
+    // 紧跟本 tick 的移动包执行 (如松弓: 服务器按此刻的朝向生成箭, 朝向包必须先到)
+    if (this.afterTickFns.length) { const fs = this.afterTickFns; this.afterTickFns = []; for (const f of fs) { try { f() } catch (e: any) { console.warn(`[${this.name}] afterTick: ${e.message}`) } } }
     this.client.write('tick_end', {})
+  }
+
+  /** 下一个 tick 发完移动包 (含最新朝向) 后立刻执行 fn */
+  afterNextTick (fn: () => void): Promise<void> {
+    return new Promise(resolve => this.afterTickFns.push(() => { fn(); resolve() }))
   }
 
   // ---------- 动作系统 ----------
@@ -452,6 +488,7 @@ export class BotAgent {
       case 'dig': a = new DigAction(this, ...xyz()); break
       case 'place': a = new PlaceAction(this, ...xyz(), int(params.face, 1), { hotbar: params.hotbar != null ? int(params.hotbar) : undefined, item: params.item }); break
       case 'attack': a = new AttackAction(this, int(params.entity_id ?? params.entityId), int(params.hits, 3)); break
+      case 'shoot': a = new ShootAction(this, int(params.entity_id ?? params.entityId), Math.max(1, Math.min(64, int(params.shots, 5))), { pickup: params.pickup !== false }); break
       case 'jump': a = new JumpAction(this); break
       case 'stop': a = new StopAction(this); break
       case 'select_slot': a = new SelectSlotAction(this, int(params.slot, 0)); break
@@ -568,7 +605,7 @@ export class BotAgent {
     this.reflex.onDeath(d.cause)
     const at = `${d.pos.x.toFixed(0)},${d.pos.y.toFixed(0)},${d.pos.z.toFixed(0)} (${d.dimension})`
     const auto = this.reflex.policy.autoRespawn
-    this.pushChat('system', `[你死了] ${d.cause} @ ${at}` + (auto ? '; 即将自动复活' : '; 用 act{type:"respawn"} 复活'))
+    this.pushChat('system', `[你死了] ${d.cause} @ ${at}` + (auto ? '; 即将自动复活' : '; 用 act{type:"respawn"} 复活'), undefined, false, true)
     // 掉落发生在死亡那一 tick, 背包清空的 set_slot 随后到: 稍等看背包是否被清空 (= 没开 keepInventory)
     setTimeout(() => this.settleDrops(d), 500)
   }
@@ -642,9 +679,33 @@ export class BotAgent {
   /** 最近一次 act() 的动作 (含库存类非主动作), wait_action 不带 id 时用 */
   get latestAction () { return this.lastAction }
 
-  private pushChat (kind: 'system' | 'player', text: string, key?: string, self = false) {
-    this.chat.push({ seq: ++this.chatSeq, kind, text, at: Date.now(), ...(key ? { key } : {}), ...(self ? { self: true } : {}) })
+  /** important: 需要提醒 agent 的消息 (默认 = 别人发的玩家聊天/私聊; 另有自己死亡) */
+  private pushChat (kind: 'system' | 'player', text: string, key?: string, self = false, important = kind === 'player' && !self) {
+    const m: ChatMessage = { seq: ++this.chatSeq, kind, text, at: Date.now(), ...(key ? { key } : {}), ...(self ? { self: true } : {}), ...(important ? { important: true } : {}) }
+    this.chat.push(m)
     if (this.chat.length > 500) this.chat.splice(0, this.chat.length - 500)
+    if (important) { const ws = this.importantWaiters; this.importantWaiters = []; ws.forEach(w => w()) }
+  }
+
+  // ---------- 收件箱: 重要消息的已读游标 ----------
+
+  /** agent 已看过的最大 seq (read_chat / wait_event / 被打断的 wait_action 返回过的消息即视为已读) */
+  chatReadSeq = 0
+  private importantWaiters: Array<() => void> = []
+
+  /** 未读的重要消息 */
+  unread (): ChatMessage[] { return this.chat.filter(m => m.important && m.seq > this.chatReadSeq) }
+
+  markRead (seq: number) { if (seq > this.chatReadSeq) this.chatReadSeq = Math.min(seq, this.chatSeq) }
+
+  /** 等到有新的重要消息 (返回 true) 或超时 (false); 已有未读时立即返回 true */
+  waitImportant (ms: number): Promise<boolean> {
+    if (this.unread().length) return Promise.resolve(true)
+    return new Promise(resolve => {
+      const w = () => { clearTimeout(t); resolve(true) }
+      const t = setTimeout(() => { this.importantWaiters = this.importantWaiters.filter(x => x !== w); resolve(false) }, ms)
+      this.importantWaiters.push(w)
+    })
   }
 
   // ---------- 容器 / 库存 ----------
@@ -655,10 +716,19 @@ export class BotAgent {
     this.inventory.heldSlot = slot
   }
 
-  /** 右键使用手持物品 (吃/喝/投掷/举盾…) */
-  useItem () {
-    this.client.write('use_item', { hand: 'main_hand', sequence: this.nextSequence(), rotation: { x: this.yaw, y: this.pitch } })
+  /** 右键使用手持物品 (吃/喝/投掷/拉弓; off_hand = 副手, 如举盾) */
+  useItem (hand: 'main_hand' | 'off_hand' = 'main_hand') {
+    this.client.write('use_item', { hand, sequence: this.nextSequence(), rotation: { x: this.yaw, y: this.pitch } })
   }
+
+  /** 松开使用中的物品 (松弓射箭 / 放下盾) = block_dig status 6 */
+  releaseUseItem () {
+    this.client.write('block_dig', { status: 6, location: { x: 0, y: 0, z: 0 }, face: 0, sequence: 0 })
+    this.usingHand = null
+  }
+
+  /** 物品组是否在冷却 (如 shield) */
+  onCooldown (group: string) { return (this.cooldowns.get(group) ?? 0) > Date.now() }
 
   /** 右键实体 (交易/喂食/骑乘/剪毛…) */
   interactEntity (entityId: number) {

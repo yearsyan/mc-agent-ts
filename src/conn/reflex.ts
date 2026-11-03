@@ -9,7 +9,14 @@ import { AsyncAction } from '../actions/base.js'
 import { MoveToAction } from '../actions/actions.js'
 import { eatOnce, bestFood, SleepAction } from '../actions/tasks.js'
 import { standableCell } from '../actions/astar.js'
-import { isHostile, isRanged, weaponScore, isNight, isWatery } from '../game/knowledge.js'
+import { isHostile, isRanged, weaponScore, isNight, isWatery, isProjectile, entitySize } from '../game/knowledge.js'
+import { projectileEta } from '../game/ballistics.js'
+import { EquipAction } from '../actions/tasks.js'
+import { ShootAction, canShoot, solveShot } from '../actions/combat.js'
+import { FLYING } from '../game/knowledge.js'
+
+/** 会拉弓/上弩的远程怪 (living_entity_flags bit0 = 正在使用物品) */
+const BOW_MOBS = new Set(['skeleton', 'stray', 'bogged', 'pillager', 'piglin', 'illusioner'])
 
 export interface Policy {
   /** 自动进食 */
@@ -26,9 +33,13 @@ export interface Policy {
   home: { x: number, y: number, z: number } | null
   /** 死亡后自动复活 (关掉则停在死亡界面, 由 act{type:"respawn"} 手动复活) */
   autoRespawn: boolean
+  /** 自动举盾 (副手有盾时): 箭飞来/骷髅拉弓/苦力怕点燃/近身怪 → 面向威胁格挡 */
+  shield: boolean
+  /** 远程: auto = 战斗时按情况用弓 (需弓+箭); never = 只近战 */
+  ranged: 'auto' | 'never'
 }
 
-export const DEFAULT_POLICY: Policy = { autoEat: true, eatAt: 14, combat: 'defend', fleeHealth: 8, avoidHazards: true, nightShelter: false, home: null, autoRespawn: true }
+export const DEFAULT_POLICY: Policy = { autoEat: true, eatAt: 14, combat: 'defend', fleeHealth: 8, avoidHazards: true, nightShelter: false, home: null, autoRespawn: true, shield: true, ranged: 'auto' }
 
 export interface ReflexEvent { at: number, text: string }
 
@@ -42,7 +53,7 @@ export class Reflex {
   policy: Policy = { ...DEFAULT_POLICY }
   events: ReflexEvent[] = []
   /** 当前在做什么 (scene 展示) */
-  state: 'idle' | 'eating' | 'fighting' | 'fleeing' | 'escaping' | 'going_home' | 'sleeping' = 'idle'
+  state: 'idle' | 'eating' | 'fighting' | 'shooting' | 'fleeing' | 'escaping' | 'going_home' | 'sleeping' = 'idle'
   private task: Action | null = null
   private lastAttackAt = 0
   private lastEatTryAt = 0
@@ -52,6 +63,19 @@ export class Reflex {
   private eatFailCount = 0
   /** 正在逃离危险地形: 直接接管控制量跑向安全点 (岩浆里等不起寻路) */
   private escape: { x: number, y: number, z: number, until: number } | null = null
+  // ---- 盾牌 ----
+  shieldUp = false
+  private shieldWantUntil = 0
+  private shieldFace: { x: number, y: number, z: number } | null = null
+  /** 举盾期间要砍一刀: 本 tick 放盾, 下 tick 攻击, 再下 tick 重新举盾 */
+  private pendingStrike: number | null = null
+  private shieldWhy = ''
+  private shieldLogAt = 0
+  private blocksSeen = 0
+  private lastEquipShieldAt = 0
+  private shootLogAt = new Map<number, number>()
+  /** 远程怪最近一次"拉弓"信号的时间: 信号随拉弓周期开关, 记 3 秒才能整段举盾 */
+  private drawSeenAt = new Map<number, number>()
 
   constructor (private bot: BotAgent) {}
 
@@ -101,6 +125,9 @@ export class Reflex {
       }
     }
 
+    // 盾牌: 每 tick 判断 (箭从拉弓到命中只有十几 tick)
+    if (this.shieldTick(now)) return
+
     if (now - this.lastCheckAt < 200) return // 其余判断每 4 tick 一次
     this.lastCheckAt = now
     if (!this.busy && this.state !== 'idle' && this.state !== 'fighting') this.state = 'idle'
@@ -121,7 +148,8 @@ export class Reflex {
     // 2) 战斗 / 逃跑
     if (p.combat !== 'ignore' && this.state !== 'escaping') {
       const threats = this.threats()
-      const creeper = threats.find(t => t.e.type === 'creeper' && t.d < 6)
+      // 苦力怕: 已点燃且很近时有盾就原地举盾硬吃 (正面格挡挡掉爆炸), 否则跑
+      const creeper = threats.find(t => t.e.type === 'creeper' && t.d < 6 && !(this.shieldReady() && t.d < 4 && this.creeperLit(t.e)))
       const lowHp = bot.health <= p.fleeHealth
       if (threats.length && (p.combat === 'flee' || creeper || (lowHp && threats.some(t => t.d < 8)))) {
         if (!(this.busy && this.state === 'fleeing') && now - this.lastFleeAt > 3000) {
@@ -137,7 +165,23 @@ export class Reflex {
         return
       }
       if (p.combat === 'defend') {
-        const target = threats.find(t => t.d <= 3.3)
+        // 远程: 有弓有箭时, 远程怪/苦力怕/飞行怪用弓; LLM 空闲时也射逼近的近战怪 (每次 1 箭, 射完重新评估)
+        if (this.busy && this.state === 'shooting') return
+        if (p.ranged === 'auto' && canShoot(bot)) {
+          const prim = bot.activeAction
+          const llmBusy = !!prim && prim.status === 'running' && !prim.byReflex
+          const cand = threats.find(t => this.worthShooting(t.e, t.d, llmBusy))
+          if (cand) {
+            const a = new ShootAction(bot, cand.e.id, 1, { melee: true, pickup: false })
+            a.onSettle = (x) => { if (x.status === 'failed') this.log(`射击 ${cand.e.type} 失败: ${x.detail}`) }
+            if (now - (this.shootLogAt.get(cand.e.id) ?? 0) > 10_000) { this.shootLogAt.set(cand.e.id, now); this.log(`弓箭迎敌 ${cand.e.type}#${cand.e.id} (距离 ${cand.d.toFixed(1)})`) }
+            this.state = 'shooting'
+            this.takeOver(a, `射击 ${cand.e.type}`)
+            return
+          }
+        }
+        // 点燃的苦力怕不去砍 (砍要放下盾, 爆炸瞬间没盾就是重伤)
+        const target = threats.find(t => t.d <= 3.3 && !(t.e.type === 'creeper' && this.creeperLit(t.e) && this.shieldReady()))
         if (target) {
           // 在吃东西/挖掘时手被占用: 挖掘让路 (打断), 吃东西就等吃完
           if (this.state !== 'eating') {
@@ -199,7 +243,7 @@ export class Reflex {
     return [...bot.world.entities.values()]
       .filter(e => isHostile(e.type) || e.id === recentAttacker)
       .map(e => ({ e, d: Math.hypot(e.x - bot.pos.x, e.y - bot.pos.y, e.z - bot.pos.z) }))
-      .filter(t => t.d < 16 && (t.d < 10 || isRanged(t.e.type) || t.e.id === recentAttacker))
+      .filter(t => t.d < 16 && (t.d < 10 || isRanged(t.e.type) || t.e.type === 'creeper' || t.e.id === recentAttacker))
       .sort((a, b) => a.d - b.d)
   }
 
@@ -213,12 +257,134 @@ export class Reflex {
     // 手里换上最好的武器 (仅在快捷栏里的, 不做背包交换以免拖慢)
     const w = bot.inventory.find(s => weaponScore(s.name) > 0).filter(h => h.slot >= 36).sort((a, b) => weaponScore(b.item.name) - weaponScore(a.item.name))[0]
     if (w && bot.handFree() && bot.inventory.heldSlot !== w.slot - 36) { bot.selectSlot(w.slot - 36); return }
+    if (this.shieldUp) { this.lowerShield(); this.pendingStrike = entityId; this.lastAttackAt = now; return } // 举盾时不能攻击: 先放下, 下 tick 砍
+    this.strike(entityId, now)
+  }
+
+  private strike (entityId: number, now: number) {
+    const bot = this.bot
+    const e = bot.world.entities.get(entityId)
+    if (!e) return
     const dx = e.x - bot.pos.x, dz = e.z - bot.pos.z
     bot.yaw = Math.atan2(-dx, dz) * 180 / Math.PI
     bot.pitch = 10
     bot.client.write('attack', { entityId })
     bot.client.write('arm_animation', { hand: 'main_hand' })
     this.lastAttackAt = now
+  }
+
+  /** 值得用弓打的威胁: 远程怪 4-24 格 / 苦力怕 6-16 格 / 飞行怪 ≤24 格 / (LLM 空闲时) 逼近的近战怪 5-14 格; 且弹道畅通 */
+  private worthShooting (e: { id: number, type: string }, d: number, llmBusy: boolean) {
+    let ok: boolean
+    if (e.type === 'creeper') ok = d >= 6 && d <= 16
+    else if (isRanged(e.type)) ok = d > 4 && d <= 24
+    else if (FLYING.has(e.type)) ok = d <= 24
+    else ok = !llmBusy && d >= 5 && d <= 14
+    if (!ok) return false
+    return solveShot(this.bot, e.id).ok
+  }
+
+  // ---------- 盾牌 ----------
+
+  shieldReady () {
+    const bot = this.bot
+    return this.policy.shield && bot.inventory.slots[45]?.name === 'shield' && !bot.onCooldown('shield')
+  }
+
+  private creeperLit (e: { meta: Record<string, any> }) { return (e.meta.swell_dir ?? -1) > 0 || !!e.meta.is_ignited }
+
+  /** 放下盾 (攻击/挖掘前调用) */
+  lowerShield () {
+    if (!this.shieldUp) return
+    if (this.bot.usingHand === 'off_hand') this.bot.releaseUseItem()
+    this.shieldUp = false
+  }
+
+  /** 每 tick: 判断威胁、举/放盾、面向威胁。返回 true 表示本 tick 已用掉 (如刚砍了一刀) */
+  private shieldTick (now: number): boolean {
+    const bot = this.bot
+    if (this.shieldUp && bot.usingHand !== 'off_hand') this.shieldUp = false // 被别的使用 (拉弓/进食) 顶掉, 或盾被击破
+    if (bot.shieldBlocks > this.blocksSeen) {
+      this.blocksSeen = bot.shieldBlocks
+      if (now - this.shieldLogAt > 1500) { this.shieldLogAt = now; this.log(`盾牌格挡 (${this.shieldWhy || '?'}, 累计 ${bot.shieldBlocks} 次)`) }
+    }
+    if (this.pendingStrike !== null) { const id = this.pendingStrike; this.pendingStrike = null; this.strike(id, now); return true }
+    // 自动把盾放到副手 (副手空着才放, 不顶掉图腾)
+    if (this.policy.shield && !bot.inventory.slots[45] && now - this.lastEquipShieldAt > 15_000 && bot.inventory.find(s => s.name === 'shield').length && bot.inventory.activeWindowId === null) {
+      this.lastEquipShieldAt = now
+      const a = new EquipAction(bot, 'shield'); a.byReflex = true
+      a.onSettle = (x) => { if (x.status === 'done') this.log('盾牌放到副手') }
+      bot.runChild(a)
+    }
+    if (!this.shieldReady()) { this.lowerShield(); return false }
+    const threat = this.shieldThreat(now)
+    if (threat) {
+      this.shieldWantUntil = now + 350
+      this.shieldFace = threat.at
+      if (threat.why !== this.shieldWhy && now - this.shieldLogAt > 3000) { this.shieldLogAt = now; this.log(`举盾: ${threat.why}`) }
+      this.shieldWhy = threat.why
+    }
+    if (now >= this.shieldWantUntil || !this.shieldFace) { this.lowerShield(); return false }
+    // 赶路中 (非逃跑) 只在威胁大致在前方时举盾, 不扭头 (否则会朝着威胁走过去); 逃跑时背对威胁, 不举
+    const prim = bot.activeAction
+    const moving = prim instanceof MoveToAction && prim.status === 'running'
+    if (moving && (this.state === 'fleeing' || prim.byReflex)) { this.lowerShield(); return false }
+    // 手被占用 (拉弓/进食/挖掘) 时不举盾也不扭头, 免得破坏瞄准
+    if (!this.shieldUp && (bot.usingHand !== null || !bot.handFree())) return false
+    const f = this.shieldFace
+    const want = Math.atan2(-(f.x - bot.pos.x), f.z - bot.pos.z) * 180 / Math.PI
+    if (moving) {
+      const diff = Math.abs(((want - bot.yaw) % 360 + 540) % 360 - 180)
+      if (diff > 60) { this.lowerShield(); return false }
+    } else {
+      bot.yaw = want
+      bot.pitch = -Math.atan2(f.y - (bot.pos.y + 1.62), Math.hypot(f.x - bot.pos.x, f.z - bot.pos.z)) * 180 / Math.PI
+    }
+    if (!this.shieldUp && bot.usingHand === null) {
+      bot.usingHand = 'off_hand'
+      bot.useItem('off_hand')
+      this.shieldUp = true
+    }
+    return false
+  }
+
+  /** 需要举盾的威胁 (按紧迫度): 飞来的弹射物 > 拉弓的远程怪 > 点燃的苦力怕 > 近身怪 */
+  private shieldThreat (now: number): { at: { x: number, y: number, z: number }, why: string } | null {
+    const bot = this.bot
+    const eye = { x: bot.pos.x, y: bot.pos.y + 1.62, z: bot.pos.z }
+    let best: { at: { x: number, y: number, z: number }, why: string, rank: number } | null = null
+    const consider = (rank: number, at: { x: number, y: number, z: number }, why: string) => { if (!best || rank < best.rank) best = { at, why, rank } }
+    for (const e of bot.world.entities.values()) {
+      const d = Math.hypot(e.x - bot.pos.x, e.y - bot.pos.y, e.z - bot.pos.z)
+      if (d > 32) continue
+      if (isProjectile(e.type)) {
+        if (e.ownerId === bot.entityId || e.meta.in_ground) continue
+        const eta = projectileEta(e, bot.pos, now)
+        if (eta !== null && eta <= 25) consider(0, { x: e.x, y: e.y, z: e.z }, `${e.type} 飞来`)
+        continue
+      }
+      if (!isHostile(e.type) && e.id !== bot.lastDamage?.attackerId) continue
+      const h = entitySize(e.type).h
+      const center = { x: e.x, y: e.y + h * 0.8, z: e.z }
+      // 骷髅拉弓时服务器不置 living_entity_flags, 而是 mob_flags bit2 (aggressive, 客户端据此画举弓动作), 随拉弓周期开关
+      const drawing = ((e.meta.living_entity_flags ?? 0) & 1) || ((e.meta.mob_flags ?? 0) & 4) || e.meta.is_charging_crossbow
+      if (BOW_MOBS.has(e.type) && drawing) this.drawSeenAt.set(e.id, now)
+      if (BOW_MOBS.has(e.type) && d <= 24 && now - (this.drawSeenAt.get(e.id) ?? 0) < 3000 && this.losTo(eye, center)) consider(1, center, `${e.type} 拉弓`)
+      else if (e.type === 'creeper' && d <= 5 && this.creeperLit(e)) consider(2, center, '苦力怕点燃')
+      else if (!isRanged(e.type) && e.type !== 'creeper' && d <= 3.5) consider(3, center, `${e.type} 近身`)
+    }
+    if (this.drawSeenAt.size > 50) for (const [id, t] of this.drawSeenAt) if (now - t > 5000) this.drawSeenAt.delete(id)
+    return best
+  }
+
+  /** 两点间无实心方块 */
+  private losTo (a: { x: number, y: number, z: number }, b: { x: number, y: number, z: number }) {
+    const n = Math.ceil(Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) / 0.3)
+    for (let i = 1; i < n; i++) {
+      const t = i / n
+      if (this.bot.world.isSolid(Math.floor(a.x + (b.x - a.x) * t), Math.floor(a.y + (b.y - a.y) * t), Math.floor(a.z + (b.z - a.z) * t))) return false
+    }
+    return true
   }
 
   /** 背离威胁方向 12-20 格的可站点 */
@@ -265,6 +431,8 @@ export class Reflex {
 
   /** 死亡: 丢掉进行中的反射任务/逃生状态 (动作本身由 bot.cancelActions 取消) */
   onDeath (cause: string) {
+    this.shieldUp = false
+    this.pendingStrike = null
     this.task = null
     this.escape = null
     this.state = 'idle'
@@ -273,6 +441,6 @@ export class Reflex {
   }
 
   status () {
-    return { state: this.state, policy: this.policy, recent: this.events.slice(-5).map(e => ({ ago_s: Math.round((Date.now() - e.at) / 1000), text: e.text })) }
+    return { state: this.state, ...(this.shieldUp ? { shield_up: true } : {}), policy: this.policy, recent: this.events.slice(-5).map(e => ({ ago_s: Math.round((Date.now() - e.at) / 1000), text: e.text })) }
   }
 }

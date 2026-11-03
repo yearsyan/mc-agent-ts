@@ -7,4 +7,6 @@ export interface ChatMessage {
   key?: string
   /** 自己发出的聊天 (player_chat 回显) */
   self?: boolean
+  /** 需要提醒 agent (别人的聊天/私聊、自己死亡) */
+  important?: boolean
 }
