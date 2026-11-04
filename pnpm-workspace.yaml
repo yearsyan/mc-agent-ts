@@ -1,0 +1,4 @@
+# pnpm 12+ 设置统一放这里 (package.json 的 pnpm 字段已废弃)
+# esbuild (tsx 的依赖) 需要跑 install 脚本装平台二进制
+allowBuilds:
+  esbuild: true

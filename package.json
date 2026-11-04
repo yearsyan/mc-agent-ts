@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Self-built protocol bot for Minecraft 26.3 (protocol 777) with MCP interface for LLM agents",
   "type": "module",
+  "packageManager": "pnpm@12.6.0",
   "main": "dist/index.js",
   "scripts": {
     "start": "tsx src/http/serve.ts",
@@ -22,8 +23,10 @@
     "minecraft-data": "^3.119.0",
     "minecraft-protocol": "^1.68.0",
     "pngjs": "^7.0.0",
+    "prismarine-block": "^1.23.0",
     "prismarine-chunk": "^1.41.0",
-    "prismarine-physics": "^1.11.1"
+    "prismarine-physics": "^1.11.1",
+    "vec3": "^0.2.0"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

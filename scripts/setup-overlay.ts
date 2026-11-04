@@ -1,10 +1,10 @@
 /**
- * 可重现的 node_modules overlay 安装器：npm install 之后运行。
+ * 可重现的 node_modules overlay 安装器：pnpm install 之后运行。
  * 1. 从 third_party/ 复制 26.2/26.3 数据目录进 minecraft-data
  * 2. 注册 dataPaths.json / data.js（26.2、26.3）
  * 3. 给 minecraft-protocol 打 entityDelta 补丁（若未打）
  * 4. 给 prismarine-chunk 注册 26.2/26.3 实现
- * 用法: npx tsx scripts/setup-overlay.ts
+ * 用法: pnpm exec tsx scripts/setup-overlay.ts
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -115,6 +115,7 @@ if (fs.existsSync(ppFeat)) {
 }
 
 // 验证
-const mcData = require(path.join(MCD, 'index.js'))('26.3')
+const { createRequire } = await import('node:module')
+const mcData = createRequire(import.meta.url)(path.join(MCD, 'index.js'))('26.3')
 if (!mcData || mcData.version.version !== 777) throw new Error('验证失败: minecraft-data("26.3") 不可用')
 console.log(`[overlay] 验证通过: 26.3 = proto ${mcData.version.version}, blocks=${Object.keys(mcData.blocksByName).length}`)
