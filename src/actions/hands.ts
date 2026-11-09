@@ -102,7 +102,59 @@ export function faceTowards (bot: BotAgent, x: number, y: number, z: number) {
   bot.pitch = -Math.atan2(dy, Math.hypot(dx, dz)) * 180 / Math.PI
 }
 
-/** 眼睛到方块中心的距离 */
+/** 眼睛到方块中心的距离 (粗略; 判断够不够得着用 canReach) */
 export function reachTo (bot: BotAgent, x: number, y: number, z: number) {
   return Math.hypot(x + 0.5 - bot.pos.x, y + 0.5 - (bot.pos.y + 1.62), z + 0.5 - bot.pos.z)
+}
+
+// ---------- 触及与视线 ----------
+
+/** 交互/挖/放的触及范围: 眼睛到方块包围盒最近点 (原版客户端 4.5, 留 0.1 余量; 服务器校验更宽) */
+export const REACH = 4.4
+
+type P3 = { x: number, y: number, z: number }
+export const eyeOf = (bot: BotAgent): P3 => ({ x: bot.pos.x, y: bot.pos.y + 1.62, z: bot.pos.z })
+
+/** 点 p 到方块 (x,y,z) 包围盒的最近距离 */
+export function boxDist (p: P3, x: number, y: number, z: number) {
+  const d = (v: number, lo: number) => Math.max(lo - v, 0, v - (lo + 1))
+  return Math.hypot(d(p.x, x), d(p.y, y), d(p.z, z))
+}
+
+/** 站在当前位置够不够得着方块 (x,y,z) */
+export const canReach = (bot: BotAgent, x: number, y: number, z: number) => boxDist(eyeOf(bot), x, y, z) <= REACH
+
+/** 一条射线 from→to (to 在目标方块内) 途中有没有被别的实心方块挡住 (体素 DDA) */
+function rayClear (world: BotAgent['world'], from: P3, to: P3, tx: number, ty: number, tz: number): boolean {
+  let cx = Math.floor(from.x), cy = Math.floor(from.y), cz = Math.floor(from.z)
+  const dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z
+  const sx = Math.sign(dx), sy = Math.sign(dy), sz = Math.sign(dz)
+  const inv = (v: number) => v !== 0 ? Math.abs(1 / v) : Infinity
+  const tdx = inv(dx), tdy = inv(dy), tdz = inv(dz)
+  const first = (f: number, c: number, s: number, td: number) => s > 0 ? (c + 1 - f) * td : s < 0 ? (f - c) * td : Infinity
+  let tmx = first(from.x, cx, sx, tdx), tmy = first(from.y, cy, sy, tdy), tmz = first(from.z, cz, sz, tdz)
+  for (let i = 0; i < 64; i++) {
+    if (cx === tx && cy === ty && cz === tz) return true
+    if (i > 0 && world.isSolid(cx, cy, cz)) return false // 起点 (眼睛所在格) 不算
+    if (tmx < tmy && tmx < tmz) { if (tmx > 1) return false; cx += sx; tmx += tdx } else if (tmy < tmz) { if (tmy > 1) return false; cy += sy; tmy += tdy } else { if (tmz > 1) return false; cz += sz; tmz += tdz }
+  }
+  return false
+}
+
+/** 从 eye 到某点 (如实体身体中心) 的视线有没有被实心方块挡住 */
+export const canSeePoint = (world: BotAgent['world'], eye: P3, p: P3) => rayClear(world, eye, p, Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))
+
+/** 眼睛到实体碰撞箱的最近距离 (原版实体交互/攻击距离 3.0) */
+export function entityBoxDist (eye: P3, e: { x: number, y: number, z: number }, w: number, h: number) {
+  const d = (v: number, lo: number, hi: number) => Math.max(lo - v, 0, v - hi)
+  return Math.hypot(d(eye.x, e.x - w / 2, e.x + w / 2), d(eye.y, e.y, e.y + h), d(eye.z, e.z - w / 2, e.z + w / 2))
+}
+
+/** 从 eye 看不看得见方块 (x,y,z): 中心与 6 个面 (内缩 0.1) 共 7 个采样点, 有一条没被挡住即可 */
+export function canSee (world: BotAgent['world'], eye: P3, x: number, y: number, z: number): boolean {
+  const pts: P3[] = [{ x: x + 0.5, y: y + 0.5, z: z + 0.5 },
+    { x: x + 0.1, y: y + 0.5, z: z + 0.5 }, { x: x + 0.9, y: y + 0.5, z: z + 0.5 },
+    { x: x + 0.5, y: y + 0.1, z: z + 0.5 }, { x: x + 0.5, y: y + 0.9, z: z + 0.5 },
+    { x: x + 0.5, y: y + 0.5, z: z + 0.1 }, { x: x + 0.5, y: y + 0.5, z: z + 0.9 }]
+  return pts.some(p => rayClear(world, eye, p, x, y, z))
 }

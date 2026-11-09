@@ -8,12 +8,14 @@
 import mc from 'minecraft-protocol'
 import { createRequire } from 'node:module'
 import { World } from '../world/world.js'
+import { parseDimType, vanillaDim, type DimType } from '../world/dimension.js'
 import { PhysicsRunner } from '../physics/runner.js'
 import { Inventory } from './inventory.js'
-import { Action, MoveToAction, DigAction, PlaceAction, AttackAction, JumpAction, StopAction, SelectSlotAction, OpenContainerAction, ChestOpAction, DropItemAction, CloseWindowAction } from '../actions/actions.js'
-import { Task, CraftAction, SmeltAction, CollectAction, PickupItemsAction, EquipAction, EatAction, UseItemAction, UseBlockAction, SleepAction, WakeAction, InteractEntityAction, DismountAction, TradeAction } from '../actions/tasks.js'
-import { Reflex } from './reflex.js'
-import { ShootAction } from '../actions/combat.js'
+import { approvalOf, type RouteProposal, type Approval } from '../actions/route.js'
+import { MAX_MOVE_DIST, Action, MoveToAction, DigAction, PlaceAction, JumpAction, StopAction, SelectSlotAction, OpenContainerAction, ChestOpAction, DropItemAction, CloseWindowAction } from '../actions/actions.js'
+import { Task, ReachThen, ChestTransferAction, containerBlocked, CraftAction, SmeltAction, CollectAction, PickupItemsAction, EquipAction, EatAction, UseItemAction, UseBlockAction, SleepAction, WakeAction, InteractEntityAction, DismountAction, TradeAction } from '../actions/tasks.js'
+import { Reflex, homeDimension } from './reflex.js'
+import { ShootAction, AttackAction } from '../actions/combat.js'
 import { itemName } from '../game/knowledge.js'
 import type { ChatMessage } from './types.js'
 import { AsyncAction } from '../actions/base.js'
@@ -109,6 +111,16 @@ export class BotAgent {
   trades: any[] | null = null
   /** 当前维度 (login / respawn 的 worldState.name) */
   dimension = 'minecraft:overworld'
+  /** 当前维度的类型: 高度/顶棚/能否睡床 */
+  dimInfo: DimType = vanillaDim('overworld')
+  /** dimension_type 注册表 (配置阶段 registry_data), worldState.dimension 是其下标 */
+  private dimTypes: DimType[] = []
+  /** 已收到 login (之后的 respawn 才可能是换维度) */
+  private dimEntered = false
+  /** 最近一次由我们打开的容器 (get_container 标注是哪个方块; windowId 不再是当前窗口时作废) */
+  openedContainer: { windowId: number, block: string, x: number, y: number, z: number } | null = null
+  /** 寻路给出的挖/搭方案 (按 id 存 10 分钟, act 参数 confirm 引用) */
+  private proposalStore = new Map<string, { p: RouteProposal, at: number }>()
   /** 死亡中 (已死、尚未复活) */
   dead = false
   /** 本次上线以来的死亡次数 / 最近一次死亡 */
@@ -188,6 +200,7 @@ export class BotAgent {
         const names = () => (p.entries ?? []).map((e: any) => String(e.key).replace(/^minecraft:/, ''))
         if (String(p.id).endsWith('damage_type')) this.damageTypes = names()
         else if (String(p.id).endsWith('chat_type')) this.chatTypes = names()
+        else if (String(p.id).endsWith('dimension_type')) this.dimTypes = (p.entries ?? []).map(parseDimType)
       })
       client.on('custom_payload', (p: any) => {
         if (p.channel === 'fabric:registry/sync') {
@@ -200,9 +213,8 @@ export class BotAgent {
       client.on('login', (packet: any) => {
         this.phase = 'play'
         this.entityId = packet.entityId
-        if (packet.worldState?.name) this.dimension = packet.worldState.name
+        this.enterDimension(packet.worldState)
         this.loginDeath = packet.worldState?.death ?? null
-        this.world.setLoginInfo(packet)
         // player_loaded 不在此处发: 要等出生点区块到达 (见 tick 里的加载门控), 与原版客户端一致
         if (process.env.MC_WIRE_DEBUG && this.client.serializer) {
           this.client.serializer.on('data', (d: Buffer) => {
@@ -221,7 +233,7 @@ export class BotAgent {
       // 复活/换维度后原版客户端会重新走一遍加载流程并再发 player_loaded
       client.on('respawn', (p: any) => {
         this.firstTeleportAt = 0; this.loadedAt = 0; this.sprintSent = false; this.physics.swimming = false; this.sleeping = false; this.vehicleId = null
-        if (p.worldState?.name) this.dimension = p.worldState.name
+        this.enterDimension(p.worldState)
         if (this.dead) this.onRespawned()
       })
       // 死亡: 服务器专门发给死者的包 (关了 showDeathMessages 时 message 为空); update_health≤0 作兜底
@@ -482,6 +494,29 @@ export class BotAgent {
     this.client.write('tick_end', {})
   }
 
+  /**
+   * login / respawn: 按 worldState 切换维度。维度变了 (或高度不同) 就清空世界模型 (区块/实体) 换新高度,
+   * 并取消进行中的动作 (路径/目标坐标都属于旧维度)。同维度复活不清 (服务器不会重发区块之外的东西)。
+   */
+  private enterDimension (ws: any) {
+    const name = String(ws?.name ?? this.dimension)
+    const t = this.dimTypes[ws?.dimension] ?? vanillaDim(name)
+    const changed = !this.dimEntered || name !== this.dimension || t.minY !== this.world.min_y || t.height !== this.world.world_height
+    const travel = this.dimEntered && name !== this.dimension
+    const from = this.dimension
+    this.dimension = name
+    this.dimInfo = t
+    this.dimEntered = true
+    if (!changed) return
+    this.world.resetDimension(t.minY, t.height, t.hasCeiling)
+    if (travel) {
+      this.cancelActions(`换维度: ${from.replace(/^minecraft:/, '')} → ${name.replace(/^minecraft:/, '')}`)
+      const nether = [from, name].includes('minecraft:the_nether') ? ' (下界 1 格 = 主世界 8 格)' : ''
+      this.pushChat('system', `[换维度] 进入 ${name.replace(/^minecraft:/, '')} (高度 ${t.minY}..${t.minY + t.height}${t.hasCeiling ? ', 有顶棚' : ''}${t.bedWorks ? '' : ', 床会爆炸'}); 坐标与原维度不通用${nether}`, undefined, false, true)
+    }
+    this.onEvent?.({ kind: 'conn', level: 'info', text: `维度 ${name} (${t.key}: y ${t.minY}..${t.minY + t.height}${t.hasCeiling ? ', 顶棚' : ''}${t.bedWorks ? '' : ', 床会爆炸'}; ${t.fromRegistry ? '注册表' : '按原版兜底'})` })
+  }
+
   /** 下一个 tick 发完移动包 (含最新朝向) 后立刻执行 fn */
   afterNextTick (fn: () => void): Promise<void> {
     return new Promise(resolve => this.afterTickFns.push(() => { fn(); resolve() }))
@@ -490,26 +525,58 @@ export class BotAgent {
   // ---------- 动作系统 ----------
 
   /** 按类型构造动作 (不启动); 脚本里的子动作也走这里 */
-  makeAction (type: string, params: any): Action {
+  /** 记下寻路方案 (只留最近 60 个) */
+  rememberProposals (ps: RouteProposal[]) {
+    const now = Date.now()
+    for (const p of ps) if (p.id) this.proposalStore.set(p.id, { p, at: now })
+    while (this.proposalStore.size > 60) this.proposalStore.delete(this.proposalStore.keys().next().value!)
+  }
+
+  /** confirm 参数 → 批准的改动; 方案不存在/过期则抛错 */
+  private approvalFor (confirm: unknown): Approval | undefined {
+    if (confirm == null || confirm === '') return undefined
+    const ids = (Array.isArray(confirm) ? confirm : String(confirm).split(',')).map(x => String(x).trim()).filter(Boolean)
+    const ps = ids.map(id => {
+      const e = this.proposalStore.get(id)
+      if (!e || Date.now() - e.at > 10 * 60_000) throw new Error(`方案 ${id} 不存在或已过期 (保留 10 分钟): 重新下达动作拿新方案`)
+      return e.p
+    })
+    return ps.length ? approvalOf(ps) : undefined
+  }
+
+  /** ctx.script: 脚本里的子动作 (moveTo 默认不限路程, 脚本自己有超时与报告) */
+  makeAction (type: string, params: any, ctx: { script?: boolean } = {}): Action {
     const int = (v: any, d?: number) => { const n = Math.floor(Number(v ?? d)); if (!Number.isFinite(n)) throw new Error(`参数缺失或不是数字 (动作 ${type})`); return n }
     const xyz = () => [int(params.x), int(params.y), int(params.z)] as const
     const str = (v: any, what: string) => { if (typeof v !== 'string' || !v) throw new Error(`${type} 需要参数 ${what}`); return v }
     // 寻路改地形的权限: 默认只走现成的路, 走不通时动作失败并给出挖/搭方案, LLM 确认后带上开关重新下达
     const flag = (v: any) => v === true || v === 'true' || v === 1
-    const moveOpts = { allowDig: flag(params.allow_dig), allowPlace: flag(params.allow_place) }
+    // confirm: "<方案id>" = 只批准该方案列出的改动 (比 allow_* 窄)
+    const moveOpts = { allowDig: flag(params.allow_dig), allowPlace: flag(params.allow_place), approved: this.approvalFor(params.confirm) }
+    // 单次寻路路程上限: LLM 下达的 move_to/go_home 默认 128 格, 可用 max_dist 调 (8~512); 脚本默认不限
+    const maxDistance = params.max_dist != null ? Math.max(8, Math.min(512, int(params.max_dist))) : ctx.script ? undefined : MAX_MOVE_DIST
     let a: Action
     switch (type) {
-      case 'move_to': a = new MoveToAction(this, { x: +params.x, y: params.y != null ? +params.y : undefined, z: +params.z }, { tolerance: params.tolerance != null ? Math.max(0, int(params.tolerance)) : undefined, ...moveOpts }); break
-      case 'dig': a = new DigAction(this, ...xyz()); break
-      case 'place': a = new PlaceAction(this, ...xyz(), int(params.face, 1), { hotbar: params.hotbar != null ? int(params.hotbar) : undefined, item: params.item }); break
+      case 'move_to': a = new MoveToAction(this, { x: +params.x, y: params.y != null ? +params.y : undefined, z: +params.z }, { tolerance: params.tolerance != null ? Math.max(0, int(params.tolerance)) : undefined, ...moveOpts, maxDistance }); break
+      // dig / place / open_container: 先走到够得着且看得见的位置再操作 (ReachThen)
+      case 'dig': { const [x, y, z] = xyz(); a = new ReachThen(this, 'dig', { x, y, z }, () => new DigAction(this, x, y, z), this.world.getBlock(x, y, z)?.name ?? '方块'); break }
+      case 'place': { const [x, y, z] = xyz(); const o = { hotbar: params.hotbar != null ? int(params.hotbar) : undefined, item: params.item }; a = new ReachThen(this, 'place', { x, y, z }, () => new PlaceAction(this, x, y, z, int(params.face, 1), o), '放置点'); break }
       case 'attack': a = new AttackAction(this, int(params.entity_id ?? params.entityId), int(params.hits, 3)); break
       case 'shoot': a = new ShootAction(this, int(params.entity_id ?? params.entityId), Math.max(1, Math.min(64, int(params.shots, 5))), { pickup: params.pickup !== false }); break
       case 'jump': a = new JumpAction(this); break
       case 'stop': a = new StopAction(this); break
       case 'select_slot': a = new SelectSlotAction(this, int(params.slot, 0)); break
-      case 'open_container': a = new OpenContainerAction(this, ...xyz()); break
-      case 'chest_take': a = new ChestOpAction(this, 'take', int(params.slot, 0)); break
-      case 'chest_put': a = new ChestOpAction(this, 'put', int(params.slot, 0)); break
+      case 'open_container': { const [x, y, z] = xyz(); const blk = containerBlocked(this, x, y, z); if (blk) throw new Error(blk); a = new ReachThen(this, 'open_container', { x, y, z }, () => new OpenContainerAction(this, x, y, z), this.world.getBlock(x, y, z)?.name ?? '容器'); break }
+      // 按物品名存取 (item 必填, count 缺省=全部, 可带 x,y,z 一步完成); 只给 slot 时走旧的按槽位 shift 点击
+      case 'chest_take': case 'chest_put': {
+        const dir = type === 'chest_take' ? 'take' : 'put'
+        if (params.item) {
+          const at = params.x != null && params.y != null && params.z != null ? { x: int(params.x), y: int(params.y), z: int(params.z) } : undefined
+          a = new ChestTransferAction(this, dir, String(params.item), params.count != null ? Math.max(1, int(params.count)) : undefined, at)
+        } else if (params.slot != null) a = new ChestOpAction(this, dir, int(params.slot))
+        else throw new Error(`${type} 需要 item (物品名), 或旧用法 slot`)
+        break
+      }
       case 'drop_item': a = new DropItemAction(this, int(params.slot, 36), !!params.all); break
       case 'close_window': a = new CloseWindowAction(this); break
       case 'craft': a = new CraftAction(this, str(params.item, 'item'), int(params.count, 1)); break
@@ -533,7 +600,9 @@ export class BotAgent {
       case 'go_home': {
         const h = this.reflex.policy.home
         if (!h) throw new Error('还没设置 home (set_policy {home: "here"} 或 {home: {x,y,z}})')
-        a = new MoveToAction(this, h, { tolerance: 1, ...moveOpts }); break
+        const hd = homeDimension(h)
+        if (hd !== this.dimension) throw new Error(`home 在 ${hd.replace(/^minecraft:/, '')} (${h.x},${h.y},${h.z}), 你现在在 ${this.dimension.replace(/^minecraft:/, '')}: 坐标不通用, 先找传送门回去`)
+        a = new MoveToAction(this, h, { tolerance: 1, ...moveOpts, maxDistance }); break
       }
       case 'script': a = new ScriptAction(this, String(params.code ?? ''), { timeoutMs: params.timeoutMs, args: params.args }); break
       default: throw new Error(`未知动作类型: ${type}`)

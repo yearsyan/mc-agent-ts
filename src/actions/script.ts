@@ -232,7 +232,7 @@ export class ScriptAction extends AsyncAction {
     if (BANNED.has(type)) throw new Error(`脚本里不能用 ${type} (要停下就 return 或 throw)`)
     // 调用时的同步栈里有脚本帧: 记下行号 (await 之后再抛错就找不到了)
     const line = errorLine(new Error())
-    const a = this.bot.makeAction(type, params ?? {})
+    const a = this.bot.makeAction(type, params ?? {}, { script: true })
     const digName = type === 'dig' ? this.bot.world.getBlock(Math.floor(params.x), Math.floor(params.y), Math.floor(params.z))?.name : undefined
     this.current = `${type} ${JSON.stringify(params ?? {})}`.slice(0, 160)
     try {
@@ -353,7 +353,7 @@ export class ScriptAction extends AsyncAction {
         const isNum = typeof a === 'number'
         const v = isNum ? toVec(a, b, c) : toVec(a)
         const o = (isNum ? d : b) ?? {}
-        return run('move_to', { x: v.x, y: v.y, z: v.z, ...(o.tolerance != null ? { tolerance: o.tolerance } : {}), ...(o.allowDig ? { allow_dig: true } : {}), ...(o.allowPlace ? { allow_place: true } : {}) })
+        return run('move_to', { x: v.x, y: v.y, z: v.z, ...(o.tolerance != null ? { tolerance: o.tolerance } : {}), ...(o.allowDig ? { allow_dig: true } : {}), ...(o.allowPlace ? { allow_place: true } : {}), ...(o.confirm ? { confirm: o.confirm } : {}), ...(o.maxDist ? { max_dist: o.maxDist } : {}) })
       },
       dig: async (a: any, y?: number, z?: number) => {
         const v = blockVec(a, y, z)

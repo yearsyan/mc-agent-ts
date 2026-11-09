@@ -1,7 +1,8 @@
 /**
  * A* 寻路: 在客户端世界模型上找可行走路径。
  * 移动方式: 平走/斜走、跳 1 格、下落 ≤4 格、平向挖穿、楼梯式上挖、浅水涉行/游泳、
- * 穿过木门/栅栏门 (执行时自动开门)、爬梯子/藤蔓、垫方块上升 (pillar)、搭桥 (bridge)。
+ * 穿过木门/栅栏门 (执行时自动开门)、爬梯子/藤蔓、垫方块上升 (pillar)、搭桥 (bridge)、
+ * 高处跳下用落地水缓冲 (waterDrop: 5..32 格, 落地前倒水、落地后收回)。
  */
 import type { World } from '../world/world.js'
 import { blockInfo, isWatery } from '../game/knowledge.js'
@@ -18,6 +19,8 @@ export interface PathNode {
   door?: boolean
   /** 目标格在水里 (游泳) */
   swim?: boolean
+  /** 超过 4 格的下落: 落地前在目标格倒水缓冲, 落地后收回 */
+  waterDrop?: boolean
 }
 
 export interface PathOptions {
@@ -32,6 +35,17 @@ export interface PathOptions {
   maxExpansions?: number
   /** 单次搜索的时间上限 (ms); 超时按无路处理, 避免长时间阻塞事件循环 (所有 bot 的 tick 都在同一线程) */
   timeBudgetMs?: number
+  /**
+   * 挖掉一格的代价 (折算成走几格); 由调用方按背包工具/挖掘耗时/是否人造方块给出, null = 这格不挖。
+   * 默认每格 2 (不看工具)。
+   */
+  digCost?: (name: string) => number | null
+  /** 有水桶时允许的最大落地水下落格数 (0 = 不用, 只走 ≤4 格的安全下落) */
+  waterDrop?: number
+  /** 只允许挖这些格 (按方案确认时); 不给 = allowDig 下都能挖 */
+  digAllowed?: (x: number, y: number, z: number) => boolean
+  /** 只允许在这些格放方块 (按方案确认时); 不给 = 有 scaffold 就都能放 */
+  placeAllowed?: (x: number, y: number, z: number) => boolean
 }
 
 const DANGER = new Set(['lava', 'fire', 'soul_fire', 'campfire', 'soul_campfire', 'magma_block', 'cactus', 'sweet_berry_bush', 'powder_snow', 'cobweb', 'wither_rose', 'pointed_dripstone'])
@@ -42,8 +56,11 @@ const FLUID = new Set(['water', 'lava', 'bubble_column'])
 const NO_DIG = /(chest|barrel|shulker_box|furnace|smoker|crafting_table|_bed$|door|fence|_wall$|anvil|enchanting_table|beacon|spawner|bedrock|end_portal|obsidian|ladder|_sign$|glass|lectern|bell|brewing_stand|hopper|dispenser|dropper|jukebox|note_block|lodestone|respawn_anchor)/
 
 const MAX_DROP = 4
+/** 落到现成的水里 / 落地水的最大下落高度: 再高下落速度 >2 格/tick, 倒水的时机窗口 (够得着地面的那一两 tick) 可能错过 */
+export const MAX_WATER_DROP = 32
 
 export const isClimbable = (name: string) => CLIMBABLE.has(name)
+const isAirName = (n: string | null) => n === 'air' || n === 'cave_air'
 /** 能开的门: 木门/栅栏门 (铁门需要红石, 视为墙) */
 export const isOpenable = (name: string) => (name.endsWith('_door') || name.endsWith('_fence_gate')) && !name.startsWith('iron_')
 /** 顶面高于 1 格, 不能站上去/跳上去 */
@@ -95,6 +112,10 @@ export function findPath (world: World, from: PathNode, to: PathNode, opts: Path
   const tol = opts.tolerance ?? 1
   const maxExp = opts.maxExpansions ?? 20000
   const deadline = performance.now() + (opts.timeBudgetMs ?? 150)
+  const digCost = opts.digCost ?? (() => 2)
+  const waterDrop = Math.min(MAX_WATER_DROP, opts.waterDrop ?? 0)
+  const digOk = opts.digAllowed ?? (() => true)
+  const placeOk = opts.placeAllowed ?? (() => true)
 
   // 坐标打包成数字做键 (比 "x,y,z" 字符串快得多)
   const pack = (x: number, y: number, z: number) => ((x + 32768) * 65536 + (z + 32768)) * 512 + (y + 64)
@@ -120,10 +141,16 @@ export function findPath (world: World, from: PathNode, to: PathNode, opts: Path
     return !passable(x, y, z)
   }
   const lavaNear = (x: number, y: number, z: number) => name(x + 1, y, z) === 'lava' || name(x - 1, y, z) === 'lava' || name(x, y, z + 1) === 'lava' || name(x, y, z - 1) === 'lava' || name(x, y + 1, z) === 'lava'
+  const digCache = new Map<string, number | null>()
+  const costOf = (n: string) => { let c = digCache.get(n); if (c === undefined) { c = digCost(n); digCache.set(n, c) } return c }
   const clearable = (x: number, y: number, z: number) => {
     const n = name(x, y, z)
-    return allowDig && !!n && (n === 'snow' || (solidish(x, y, z) && isDiggable(n) && !lavaNear(x, y, z)))
+    return allowDig && !!n && (n === 'snow' || (solidish(x, y, z) && isDiggable(n) && !lavaNear(x, y, z))) && costOf(n) !== null && digOk(x, y, z)
   }
+  /** 清出这格的代价: 本来能过 = 0 */
+  const clearCost = (x: number, y: number, z: number) => passable(x, y, z) ? 0 : costOf(name(x, y, z)!) ?? 0
+  /** 楼梯式上挖顶上那格 (起跳头顶空间): 挖得动才挖, 计入代价 */
+  const headroomCost = (x: number, y: number, z: number) => { const n = name(x, y, z); return n && solidish(x, y, z) && isDiggable(n) && digOk(x, y, z) ? costOf(n) ?? 0 : 0 }
   const isWater = (x: number, y: number, z: number) => isWatery(name(x, y, z))
   const climbable = (x: number, y: number, z: number) => { const n = name(x, y, z); return !!n && CLIMBABLE.has(n) }
   const hasDoor = (x: number, y: number, z: number) => { const a = name(x, y, z), b = name(x, y + 1, z); return (!!a && isOpenable(a)) || (!!b && isOpenable(b)) }
@@ -179,7 +206,7 @@ export function findPath (world: World, from: PathNode, to: PathNode, opts: Path
     if (climbable(cur.x, cur.y - 1, cur.z)) push({ x: cur.x, y: cur.y - 1, z: cur.z, climb: true }, 1.2)
     // 竖直: 挖脚下下去 (下方 2 格须实心可落脚, 且不是岩浆)
     if (!curInWater && !curOnLadder && clearable(cur.x, cur.y - 1, cur.z) && solidish(cur.x, cur.y - 2, cur.z) && name(cur.x, cur.y - 2, cur.z) !== 'lava') {
-      push({ x: cur.x, y: cur.y - 1, z: cur.z, dig: 'down' }, 5)
+      push({ x: cur.x, y: cur.y - 1, z: cur.z, dig: 'down' }, 3 + clearCost(cur.x, cur.y - 1, cur.z))
     }
     // 竖直: 水里上浮
     if (curInWater && allowSwim && (isWater(cur.x, cur.y + 1, cur.z) || passable(cur.x, cur.y + 1, cur.z)) && (isWater(cur.x, cur.y + 2, cur.z) || passable(cur.x, cur.y + 2, cur.z))) {
@@ -187,7 +214,7 @@ export function findPath (world: World, from: PathNode, to: PathNode, opts: Path
     }
     // 竖直: 垫方块上升 (脚下实心, 头顶 2 格空); 当前节点本身是 pillar 时脚下就是刚放的方块 (世界模型里还没有)
     // 只在目标更高时考虑 (否则到处都能往上垫, 搜索空间爆炸)
-    if (scaffold > 0 && to.y > cur.y && !curInWater && !curOnLadder && (solidish(cur.x, cur.y - 1, cur.z) || cur.place === 'pillar') && passable(cur.x, cur.y + 2, cur.z) && openAir(cur.x, cur.y + 2, cur.z)) {
+    if (scaffold > 0 && to.y > cur.y && !curInWater && !curOnLadder && (solidish(cur.x, cur.y - 1, cur.z) || cur.place === 'pillar') && passable(cur.x, cur.y + 2, cur.z) && openAir(cur.x, cur.y + 2, cur.z) && placeOk(cur.x, cur.y, cur.z)) {
       push({ x: cur.x, y: cur.y + 1, z: cur.z, place: 'pillar' }, 6)
     }
 
@@ -215,22 +242,26 @@ export function findPath (world: World, from: PathNode, to: PathNode, opts: Path
       // 2) 平向挖穿 (feet+head 需清除, 上方空, 下方实心); 只挖正交方向
       if (!diagonal && (clearable(nx, cur.y, nz) || passable(nx, cur.y, nz)) && (clearable(nx, cur.y + 1, nz) || passable(nx, cur.y + 1, nz)) &&
         (clearable(nx, cur.y, nz) || clearable(nx, cur.y + 1, nz)) && solidish(nx, cur.y - 1, nz)) {
-        push({ x: nx, y: cur.y, z: nz, dig: 'flat' }, cost + 4)
+        push({ x: nx, y: cur.y, z: nz, dig: 'flat' }, cost + clearCost(nx, cur.y, nz) + clearCost(nx, cur.y + 1, nz))
       }
 
       // 3) 楼梯式上挖: 站上层 cur.y+1, 挖 (nx,y+1)+(nx,y+2)
       if (!diagonal && !curInWater && (clearable(nx, cur.y + 1, nz) || passable(nx, cur.y + 1, nz)) && (clearable(nx, cur.y + 2, nz) || passable(nx, cur.y + 2, nz)) &&
         (clearable(nx, cur.y + 1, nz) || clearable(nx, cur.y + 2, nz)) && solidish(nx, cur.y, nz) && passable(cur.x, cur.y + 2, cur.z)) {
-        push({ x: nx, y: cur.y + 1, z: nz, dig: 'up' }, cost + 5)
+        push({ x: nx, y: cur.y + 1, z: nz, dig: 'up' }, cost + 1 + clearCost(nx, cur.y + 1, nz) + clearCost(nx, cur.y + 2, nz) + headroomCost(nx, cur.y + 3, nz))
       }
 
-      // 4) 下落
+      // 4) 下落: ≤4 格直接跳; 更高的只能落进现成的水里, 或有水桶时落地前倒水缓冲 (落地格须是空气才倒得下水)
       let landed = false
-      for (let drop = 1; drop <= MAX_DROP && cornersClear(cur.y, 2); drop++) {
+      for (let drop = 1; drop <= MAX_WATER_DROP && cornersClear(cur.y, 2); drop++) {
         const ny = cur.y - drop
         if (!passable(nx, ny + 1, nz) && !isWater(nx, ny + 1, nz)) break // 途中受阻
-        if (standable(nx, ny, nz)) { push({ x: nx, y: ny, z: nz }, cost + drop * 0.4); landed = true; break }
-        if (allowSwim && isWater(nx, ny, nz) && !isWater(nx, ny + 1, nz)) { push({ x: nx, y: ny, z: nz, swim: true }, cost + 1.5); landed = true; break }
+        if (standable(nx, ny, nz)) {
+          if (drop <= MAX_DROP) { push({ x: nx, y: ny, z: nz }, cost + drop * 0.4); landed = true }
+          else if (drop <= waterDrop && !diagonal && isAirName(name(nx, ny, nz))) { push({ x: nx, y: ny, z: nz, waterDrop: true }, cost + drop * 0.4 + 4); landed = true }
+          break
+        }
+        if (allowSwim && isWater(nx, ny, nz) && !isWater(nx, ny + 1, nz)) { push({ x: nx, y: ny, z: nz, swim: true }, cost + 1.5 + Math.max(0, drop - MAX_DROP) * 0.4); landed = true; break }
       }
 
       // 5) 水面移动: feet 水, head 空 (浅水涉行便宜, 深水游泳贵)
@@ -243,7 +274,7 @@ export function findPath (world: World, from: PathNode, to: PathNode, opts: Path
 
       // 6) 搭桥: 正交方向前方脚下是空的 (且不是能落脚的浅坑)
       if (scaffold > 0 && !diagonal && !landed && !curInWater && passable(nx, cur.y, nz) && passable(nx, cur.y + 1, nz) &&
-        !door && passable(nx, cur.y - 1, nz) && !isWater(nx, cur.y - 1, nz) && !standable(nx, cur.y, nz)) {
+        !door && passable(nx, cur.y - 1, nz) && !isWater(nx, cur.y - 1, nz) && !standable(nx, cur.y, nz) && placeOk(nx, cur.y - 1, nz)) {
         push({ x: nx, y: cur.y, z: nz, place: 'bridge' }, cost + 5)
       }
     }

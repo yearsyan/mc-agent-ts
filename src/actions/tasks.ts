@@ -4,29 +4,34 @@
  */
 import type { BotAgent } from '../conn/bot.js'
 import { AsyncAction } from './base.js'
-import { MoveToAction, DigAction, PlaceAction, scaffoldSlots, type MoveOptions } from './actions.js'
-import { RouteLog, settleWithRoute, proposalCost, type RouteProposal } from './route.js'
+import { MoveToAction, DigAction, PlaceAction, scaffoldSlots, toolCandidates, type MoveOptions } from './actions.js'
+import { RouteLog, settleWithRoute, proposalCost, type RouteProposal, type Approval } from './route.js'
 import { standableCell } from './astar.js'
-import { holdSlot, holdItem, holdNothing, closeContainer, faceTowards, reachTo } from './hands.js'
-import { mcData, itemName, itemId, foodScore, fuelTicks, blockProps } from '../game/knowledge.js'
+import { holdSlot, holdItem, holdNothing, closeContainer, faceTowards, canReach, canSee, boxDist, eyeOf, REACH } from './hands.js'
+import type { Action } from './base.js'
+import { mcData, itemName, itemId, foodScore, fuelTicks, blockProps, bestToolFor, harvestToolNames } from '../game/knowledge.js'
 
 const AIRISH = new Set(['air', 'cave_air', 'void_air'])
 const BED_COLORS = ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray', 'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black']
 
 // ---------- 共用: 接近方块 / 找或放工作方块 ----------
 
-/** 能站、且从那里够得着 (x,y,z) 的位置, 按离 bot 远近排序; 同一列只取目标下方 ≥2 格 (仰头挖, 不挖脚下) */
-export function approachSpots (bot: BotAgent, x: number, y: number, z: number, maxReach = 4.2): { x: number, y: number, z: number }[] {
-  const out: { x: number, y: number, z: number, d: number }[] = []
-  for (let dx = -3; dx <= 3; dx++) for (let dz = -3; dz <= 3; dz++) for (let dy = -4; dy <= 1; dy++) {
+/**
+ * 能站、且从那里够得着 (x,y,z) 的位置 (水平 ±4, 竖直按触及距离自然过滤: 目标下方最多约 6 格)。
+ * 能看见目标 (视线不被挡) 的排前面, 其次离 bot 近的; 同一列只取目标下方 ≥2 格 (仰头挖, 不挖脚下)。
+ * maxReach 比 REACH 小一点: 走到站位允许 ~0.4 的偏差。
+ */
+export function approachSpots (bot: BotAgent, x: number, y: number, z: number, maxReach = REACH - 0.4): { x: number, y: number, z: number, visible: boolean }[] {
+  const out: { x: number, y: number, z: number, visible: boolean, d: number }[] = []
+  for (let dx = -4; dx <= 4; dx++) for (let dz = -4; dz <= 4; dz++) for (let dy = -6; dy <= 2; dy++) {
     if (dx === 0 && dz === 0 && dy > -2) continue
     const sx = x + dx, sy = y + dy, sz = z + dz
-    const reach = Math.hypot(x - sx, y + 0.5 - (sy + 1.62), z - sz)
-    if (reach > maxReach) continue
+    const eye = { x: sx + 0.5, y: sy + 1.62, z: sz + 0.5 }
+    if (boxDist(eye, x, y, z) > maxReach) continue
     if (!standableCell(bot.world, sx, sy, sz)) continue
-    out.push({ x: sx, y: sy, z: sz, d: Math.hypot(sx + 0.5 - bot.pos.x, (sy - bot.pos.y) * 1.5, sz + 0.5 - bot.pos.z) })
+    out.push({ x: sx, y: sy, z: sz, visible: canSee(bot.world, eye, x, y, z), d: Math.hypot(sx + 0.5 - bot.pos.x, (sy - bot.pos.y) * 1.5, sz + 0.5 - bot.pos.z) })
   }
-  return out.sort((a, b) => a.d - b.d).map(({ x, y, z }) => ({ x, y, z }))
+  return out.sort((a, b) => Number(b.visible) - Number(a.visible) || a.d - b.d).map(({ x, y, z, visible }) => ({ x, y, z, visible }))
 }
 export const approachSpot = (bot: BotAgent, x: number, y: number, z: number) => approachSpots(bot, x, y, z)[0] ?? null
 
@@ -69,42 +74,53 @@ function exposed (bot: BotAgent, x: number, y: number, z: number) {
 }
 
 /**
- * 走到能够着 (x,y,z) 的位置; 已够着则不动。
- * 先只走现成的路试各接近点; 任务获准改地形 (allow_dig/allow_place) 才垫高上去 / 挖进去 (埋着的矿);
- * 未获准又走不到时, 算出改动最少的挖/搭方案放进任务的 extra.proposals 并失败, 由 LLM 决定。
+ * 走到能够着并看得见 (x,y,z) 的位置; 返回站位说明 ("" = 原地就行)。
+ * - 当前位置够得着且看得见 → 不动
+ * - 够得着但隔着方块 → 去附近看得见的站位; 附近没有就原地隔着操作 (服务器不校验视线), 结果里注明
+ * - 够不着 → 只走现成的路试接近点 (看得见的优先); 获准改地形 (allow_* / confirm) 才垫高/挖进去;
+ *   未获准又走不到时, 算出改动最少的挖/搭方案放进任务的 extra.proposals 并失败, 由 LLM 决定
  */
-async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: number, what: string) {
-  if (reachTo(bot, x, y, z) <= 4.3) return
-  const { allowDig, allowPlace } = act.moveOpts
-  const approach = approachSpots(bot, x, y, z).slice(0, 3)
+async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: number, what: string): Promise<string> {
+  const here = canReach(bot, x, y, z)
+  if (here && canSee(bot.world, eyeOf(bot), x, y, z)) return ''
+  const { allowDig, allowPlace, approved } = act.moveOpts
+  const canDig = allowDig || !!approved?.dig.size, canPlace = allowPlace || !!approved?.place.size
+  const all = approachSpots(bot, x, y, z)
+  const approach = (here ? all.filter(s => s.visible) : all).slice(0, 3)
   let err = ''
+  const at = (s: { x: number, y: number, z: number }, seen = canSee(bot.world, eyeOf(bot), x, y, z)) =>
+    `站到 (${s.x},${s.y},${s.z}) 操作${seen ? '' : ' (看不到它, 隔着方块)'}`
   const tryAll = async (spots: { x: number, y: number, z: number }[], opts: MoveOptions) => {
     for (const spot of spots) {
       const mv = await act.subMove(spot, { tolerance: 0, ...opts })
-      if (mv.status === 'done' && reachTo(bot, x, y, z) <= 4.6) return true
+      if (mv.status === 'done' && canReach(bot, x, y, z)) return at(spot)
       err = mv.status === 'done' ? '到了但还是够不着' : mv.detail
     }
-    return false
+    return null
   }
   // 第一轮: 只走现成的路 (有的接近点看似能站却到不了, 如树冠上)
-  if (await tryAll(approach, { allowDig: false, allowPlace: false })) return
+  const r1 = await tryAll(approach, { allowDig: false, allowPlace: false })
+  if (r1) return r1
+  if (here) return '原地操作 (看不到它, 附近也没有看得见的站位, 隔着方块)'
   const pillar = pillarSpot(bot, x, y, z)
   const digIn = digInSpots(bot, x, y, z)
-  // 第二轮: 已获准改地形, 带权限再试 (接近点 → 垫高点 → 挖进去)
-  if (allowDig || allowPlace) {
-    const spots = [...approach, ...(allowPlace && pillar ? [pillar] : []), ...(allowDig ? digIn : [])]
-    if (!spots.length) throw new Error(`${what} (${x},${y},${z}) 够不着: 周围没有能站/能垫高/能挖进去的位置${allowPlace && !scaffoldSlots(bot).length ? ' (背包没有泥土/圆石, 垫不了)' : ''}`)
-    if (await tryAll(spots, {})) return
+  // 第二轮: 已获准改地形 (整趟允许或按方案确认), 带权限再试 (接近点 → 垫高点 → 挖进去)
+  if (canDig || canPlace) {
+    const spots = [...approach, ...(canPlace && pillar ? [pillar] : []), ...(canDig ? digIn : [])]
+    if (!spots.length) throw new Error(`${what} (${x},${y},${z}) 够不着: 周围没有能站/能垫高/能挖进去的位置${canPlace && !scaffoldSlots(bot).length ? ' (背包没有泥土/圆石, 垫不了)' : ''}`)
+    const r2 = await tryAll(spots, {})
+    if (r2) return r2
     throw new Error(`走到${what}失败: ${err}`)
   }
-  // 未获准: 对垫高点/挖进点/最近接近点算方案, 取改动最少的
+  // 未获准: 对垫高点/挖进点/最近接近点算方案, 取最好的
   const cands = [pillar ?? pillarSpot(bot, x, y, z, 64), digIn[0], approach[0]]
     .filter((c): c is { x: number, y: number, z: number } => !!c).slice(0, 2)
   let best: { mv: MoveToAction, props: RouteProposal[] } | null = null
-  const cost = (ps: RouteProposal[]) => Math.min(...ps.map(proposalCost))
+  // 有推荐方案的优先, 其次改动最少
+  const cost = (ps: RouteProposal[]) => Math.min(...ps.map(p => (p.recommended ? 0 : 1000) + proposalCost(p)))
   for (const spot of cands) {
     const mv = await act.subMove(spot, { tolerance: 0, allowDig: false, allowPlace: false, propose: true })
-    if (mv.status === 'done' && reachTo(bot, x, y, z) <= 4.6) return
+    if (mv.status === 'done' && canReach(bot, x, y, z)) return at(spot)
     const props = (mv.extra?.proposals as RouteProposal[] | undefined) ?? []
     if (props.length && (!best || cost(props) < cost(best.props))) best = { mv, props }
     else if (!best) err = mv.status === 'done' ? '到了但还是够不着' : mv.detail
@@ -118,8 +134,8 @@ async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: nu
 
 /** 带 subMove 的任务基类 */
 export abstract class Task extends AsyncAction {
-  /** 寻路能否改地形 (act 参数 allow_dig / allow_place 传入; 默认都不允许) */
-  moveOpts: { allowDig?: boolean, allowPlace?: boolean } = {}
+  /** 寻路能否改地形 (act 参数 allow_dig / allow_place / confirm 传入; 默认都不允许) */
+  moveOpts: { allowDig?: boolean, allowPlace?: boolean, approved?: Approval } = {}
   /** 各段寻路实际改动的地形 (汇总) */
   readonly route = new RouteLog()
   private curMove: MoveToAction | null = null
@@ -149,7 +165,7 @@ export abstract class Task extends AsyncAction {
   protected async ensureStation (block: string, label: string): Promise<{ x: number, y: number, z: number }> {
     const bot = this.bot
     const near = bot.world.findBlock(block, Math.floor(bot.pos.x), Math.floor(bot.pos.z), 32, 5, Math.floor(bot.pos.y))
-    const inReach = near.find(b => reachTo(bot, b.x, b.y, b.z) <= 4.4)
+    const inReach = near.find(b => canReach(bot, b.x, b.y, b.z) && canSee(bot.world, eyeOf(bot), b.x, b.y, b.z))
     if (inReach) return inReach
     if (near.length) {
       const t = near[0]
@@ -390,6 +406,8 @@ export class PickupItemsAction extends Task {
       const e = items[0]
       const itemName = e.type === 'item' ? e.item : 'arrow'
       if (bot.inventory.emptySlots() === 0 && !bot.inventory.find(s => s.name === itemName && s.count < 64).length) { skip.add(e.id); continue }
+      // 还在半空往下掉 (如高处挖下来的原木): 等它落地再走, 免得朝空中走失败几次就放弃
+      if (!standableCell(bot.world, Math.floor(e.x), Math.floor(e.y + 0.2), Math.floor(e.z)) && Date.now() - t0 < 3000) { await this.sleep(150); continue }
       const mv = await this.subMove({ x: e.x, y: Math.floor(e.y + 0.2), z: e.z }, { tolerance: 0, timeoutMs: 15_000 })
       if (mv.status !== 'done') { miss(e.id); continue }
       // 走到了: 等一下拾取; 还在就记一次未命中
@@ -410,6 +428,12 @@ export class CollectAction extends Task {
   protected async run () {
     const bot = this.bot
     if (!mcData.blocksByName[this.block]) throw new Error(`未知方块 ${this.block}`)
+    // 先看工具: 挖了也不掉落 (如空手挖石头/矿) 就别去挖, 直接说需要什么
+    if (!bestToolFor(this.block, toolCandidates(bot)).harvest) {
+      const need = harvestToolNames(this.block)
+      const have = toolCandidates(bot).map(t => t.name)
+      throw new Error(`采 ${this.block} 至少要 ${need[0] ?? '合适的工具'}${need.length > 1 ? ` (或 ${need.slice(1, 4).join('/')})` : ''} 才会掉落, 背包里没有${have.length ? ` (现有工具: ${[...new Set(have)].join(', ')})` : ''}`)
+    }
     const before = bot.inventory.summary()
     const failed = new Set<string>()
     let mined = 0, lastErr = ''
@@ -419,7 +443,7 @@ export class CollectAction extends Task {
         .filter(h => !failed.has(`${h.x},${h.y},${h.z}`))
       if (!hits.length) break
       // 优先已经够得着的, 其次有暴露面的 (不用挖进去), 最后最近的
-      const t = hits.find(h => reachTo(bot, h.x, h.y, h.z) <= 4.3) ?? hits.find(h => exposed(bot, h.x, h.y, h.z)) ?? hits[0]
+      const t = hits.find(h => canReach(bot, h.x, h.y, h.z) && canSee(bot.world, eyeOf(bot), h.x, h.y, h.z)) ?? hits.find(h => exposed(bot, h.x, h.y, h.z)) ?? hits[0]
       const k = `${t.x},${t.y},${t.z}`
       try {
         await reachBlock(this, bot, t.x, t.y, t.z, this.block)
@@ -529,6 +553,7 @@ export class UseBlockAction extends Task {
     const { bot, x, y, z } = this
     const b0 = bot.world.getBlock(x, y, z)
     if (!b0) throw new Error(`(${x},${y},${z}) 未加载`)
+    if (b0.name.endsWith('_bed')) bedSafe(bot)
     await reachBlock(this, bot, x, y, z, b0.name)
     if (this.item) await holdItem(this, bot, this.item); else await holdNothing(this, bot)
     faceTowards(bot, x + 0.5, y + 0.5, z + 0.5)
@@ -547,10 +572,16 @@ export class UseBlockAction extends Task {
   }
 }
 
+/** 下界/末地右键床会爆炸: 直接拒绝 */
+function bedSafe (bot: BotAgent) {
+  if (!bot.dimInfo.bedWorks) throw new Error(`在 ${bot.dimension.replace(/^minecraft:/, '')} 用床会爆炸, 不睡 (只有主世界能睡)`)
+}
+
 export class SleepAction extends Task {
   constructor (bot: BotAgent, private at?: { x: number, y: number, z: number }) { super(bot, 'sleep') }
   protected async run () {
     const bot = this.bot
+    bedSafe(bot)
     let bed = this.at
     if (!bed) {
       const all = BED_COLORS.flatMap(c => bot.world.findBlock(`${c}_bed`, Math.floor(bot.pos.x), Math.floor(bot.pos.z), 24, 2, Math.floor(bot.pos.y)))
@@ -677,5 +708,131 @@ export class TradeAction extends Task {
 
   protected cleanup () {
     if (this.wid !== null) this.bot.closeWindow(this.wid)
+  }
+}
+
+// ---------- 先走近再操作 ----------
+
+/**
+ * dig / place / open_container: 先走到够得着且看得见目标的位置 (reachBlock), 再执行原动作。
+ * 动作类型名保持原样 (日志/脚本统计不变)。
+ */
+export class ReachThen extends Task {
+  constructor (bot: BotAgent, type: string, private at: { x: number, y: number, z: number }, private inner: () => Action, private what: string) { super(bot, type) }
+  protected async run () {
+    const { x, y, z } = this.at
+    const where = await reachBlock(this, this.bot, x, y, z, this.what)
+    const a = await this.sub(this.inner())
+    if (a.status !== 'done') throw new Error(`${a.detail}${where ? ` (${where})` : ''}`)
+    return `${a.detail}${where ? ` (${where})` : ''}`
+  }
+}
+
+// ---------- 容器存取 (按物品名) ----------
+
+/** 箱盖上方允许的方块: 原版只有"完整的导电方块"才会挡住箱盖 (玻璃/树叶/台阶/楼梯/另一个箱子等不挡) */
+const LID_OK = /(glass|leaves|_slab$|_stairs$|_fence|_wall$|_pane$|chest$|_carpet$|_sign$|torch|lantern|_button$|pressure_plate|^ice$|^frosted_ice$|_trapdoor$|^snow$|^scaffolding$|^hopper$)/
+
+/**
+ * 箱子类 (chest / trapped_chest / ender_chest) 打不开的原因: 上方是完整实心方块, 或有猫坐在上面。null = 没问题。
+ * 其他容器 (木桶/漏斗/潜影盒…) 不检查。
+ */
+export function containerBlocked (bot: BotAgent, x: number, y: number, z: number): string | null {
+  const b = bot.world.getBlock(x, y, z)
+  if (!b || !/(^|_)chest$/.test(b.name)) return null
+  const above = bot.world.getBlock(x, y + 1, z)
+  if (above && bot.world.isSolid(x, y + 1, z) && !LID_OK.test(above.name)) {
+    return `${b.name} (${x},${y},${z}) 上方是 ${above.name}, 箱盖打不开 (上方要空着, 或是玻璃/树叶/台阶这类非完整方块)`
+  }
+  const cat = [...bot.world.entities.values()].find(e => e.type === 'cat' && Math.floor(e.x) === x && Math.floor(e.y + 0.1) === y + 1 && Math.floor(e.z) === z)
+  if (cat) return `${b.name} (${x},${y},${z}) 上面坐着猫 #${cat.id}, 箱盖打不开`
+  return null
+}
+
+/**
+ * chest_take / chest_put 按物品名存取: {item, count?, x?,y?,z?}
+ * - 给了坐标: 走过去 (reachBlock) → 打开 → 存取 → 关上; 没给: 用当前打开的容器 (open_container 之后)
+ * - count 缺省 = 全部; 整组用 shift 点击, 零头用"拿起整组 → 右键逐个放 → 放回剩余"
+ * - 每一步核对数量变化, 背包满/箱子满时停下并说明
+ */
+export class ChestTransferAction extends Task {
+  private openedHere: number | null = null
+  constructor (bot: BotAgent, private dir: 'take' | 'put', private item: string, private count?: number, private at?: { x: number, y: number, z: number }) {
+    super(bot, `chest_${dir}`)
+  }
+
+  protected async run () {
+    const bot = this.bot
+    if (!mcData.itemsByName[this.item]) throw new Error(`未知物品 ${this.item}`)
+    let where = '', label = '容器'
+    if (this.at) {
+      const { x, y, z } = this.at
+      const b = bot.world.getBlock(x, y, z)
+      if (!b) throw new Error(`(${x},${y},${z}) 未加载`)
+      label = b.name
+      const blocked = containerBlocked(bot, x, y, z)
+      if (blocked) throw new Error(blocked)
+      const o = bot.openedContainer
+      const already = bot.inventory.activeWindowId !== null && o?.windowId === bot.inventory.activeWindowId && o.x === x && o.y === y && o.z === z
+      if (!already) {
+        where = await reachBlock(this, bot, x, y, z, b.name)
+        this.openedHere = await this.openAt(x, y, z, 37, b.name)
+        bot.openedContainer = { windowId: this.openedHere, block: b.name, x, y, z }
+      }
+    } else if (bot.openedContainer?.windowId === bot.inventory.activeWindowId) label = bot.openedContainer!.block
+    const wid = bot.inventory.activeWindowId
+    if (wid === null) throw new Error('没有打开的容器 (给 x,y,z 会自动走过去打开)')
+    const w = bot.inventory.windows.get(wid)
+    const size = (w?.slots.length ?? 0) - 36
+    if (!w || size <= 0) throw new Error('当前窗口不是容器')
+
+    // 窗口坐标: 0..size-1 容器, size..size+35 玩家背包
+    const take = this.dir === 'take'
+    const src = take ? [0, size] : [size, size + 36]
+    const dst = take ? [size, size + 36] : [0, size]
+    const name = this.item
+    const sum = ([a, b]: number[]) => { let n = 0; for (let i = a; i < b; i++) if (w.slots[i]?.name === name) n += w.slots[i]!.count; return n }
+    const maxStack = mcData.itemsByName[name]?.stackSize ?? 64
+    const want = this.count ?? Infinity
+    let moved = 0, stop = ''
+    while (moved < want) {
+      this.check()
+      const need = want - moved
+      let s = -1
+      for (let i = src[0]; i < src[1]; i++) if (w.slots[i]?.name === name) { s = i; break }
+      if (s < 0) break
+      const sc = w.slots[s]!.count
+      const before = sum(dst)
+      if (sc <= need) {
+        bot.clickSlot(wid, s, 0, 1) // shift: 整组移过去 (目标区自动合并/找空位)
+      } else {
+        // 零头: 目标区找同类有空间的, 否则空格
+        let d = -1
+        for (let i = dst[0]; i < dst[1]; i++) { const t = w.slots[i]; if (t?.name === name && t.count + need <= maxStack) { d = i; break } }
+        if (d < 0) for (let i = dst[0]; i < dst[1]; i++) if (!w.slots[i]) { d = i; break }
+        if (d < 0) { stop = take ? '背包满了' : `${label}满了`; break }
+        bot.clickSlot(wid, s, 0, 0) // 拿起整组
+        for (let k = 0; k < need; k++) bot.clickSlot(wid, d, 1, 0) // 右键放 1 个
+        bot.clickSlot(wid, s, 0, 0) // 剩余放回
+      }
+      try {
+        await this.until(() => sum(dst) > before, 1500, '物品转移')
+        await this.sleep(100) // 等同批次的槽位更新到齐
+      } catch { stop = take ? '背包满了' : `${label}满了`; break }
+      moved += sum(dst) - before
+    }
+    const leftIn = sum([0, size]), inInv = bot.inventory.count(name)
+    this.extra = { ...this.extra, item: name, moved, in_container: leftIn, in_inventory: inInv }
+    const tail = `${where ? ` (${where})` : ''}`
+    if (!moved) {
+      const why = stop || (take ? `${label}里没有 ${name}` : `背包里没有 ${name}`)
+      throw new Error(`${take ? '没拿到' : '没放进去'} ${name}: ${why}${tail}`)
+    }
+    const short = Number.isFinite(want) && moved < want ? `, 只${take ? '拿到' : '放了'} ${moved}/${want}${stop ? ` (${stop})` : ` (${take ? label + '里' : '背包里'}没有更多了)`}` : (stop ? ` (${stop})` : '')
+    return `${take ? `从 ${label} 拿了` : `往 ${label} 放了`} ${name}×${moved}${short}; ${label}里还有 ${leftIn}, 背包里有 ${inInv}${tail}`
+  }
+
+  protected cleanup () {
+    if (this.openedHere !== null) { this.bot.closeWindow(this.openedHere); this.openedHere = null }
   }
 }

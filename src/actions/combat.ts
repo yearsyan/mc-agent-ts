@@ -3,12 +3,70 @@
  */
 import type { BotAgent } from '../conn/bot.js'
 import { Task } from './tasks.js'
-import { AttackAction } from './actions.js'
-import { holdSlot } from './hands.js'
+import { holdSlot, faceTowards, eyeOf, entityBoxDist, canSeePoint } from './hands.js'
 import { aimAt, traceArrow, type Aim } from '../game/ballistics.js'
 import { entityVelocity } from '../world/world.js'
 import { standableCell } from './astar.js'
-import { ARROW_ITEMS, FLYING, entitySize } from '../game/knowledge.js'
+import { ARROW_ITEMS, FLYING, entitySize, weaponScore, attackCooldownMs } from '../game/knowledge.js'
+
+// ---------- 近战 ----------
+
+/** 原版攻击距离: 眼睛到目标碰撞箱 3.0; 留一点余量 */
+const MELEE_REACH = 2.9
+
+/**
+ * 近战: 换上最好的武器, 追着目标打 hits 下。
+ * - 够不着或隔着方块看不见 → 朝目标当前位置走一小段 (≤2.5s, 只走现成的路) 再判断, 目标移动也能跟上
+ * - 两次挥砍间隔按武器攻速 (剑 0.63s, 斧 1~1.25s…), 冷却转满再挥, 打满伤害
+ * - 连续 4 次靠近都没进展 → 失败 (走不过去/目标跑了)
+ */
+export class AttackAction extends Task {
+  constructor (bot: BotAgent, private entityId: number, private maxHits = 3) { super(bot, 'attack') }
+
+  protected async run () {
+    const bot = this.bot
+    const first = bot.world.entities.get(this.entityId)
+    if (!first) throw new Error(`实体 ${this.entityId} 不存在`)
+    const type = first.type
+    const weapons = bot.inventory.find(s => weaponScore(s.name) > 0).sort((a, b) => weaponScore(b.item.name) - weaponScore(a.item.name))
+    if (weapons.length) await holdSlot(this, bot, weapons[0].slot)
+    const weapon = bot.inventory.held()?.name ?? null
+    const cd = attackCooldownMs(weapon)
+    const size = entitySize(type)
+    const t0 = Date.now(), limit = 10_000 + this.maxHits * 5_000
+    let hits = 0, lastHit = 0, stuck = 0, chased = 0
+    while (hits < this.maxHits) {
+      this.check()
+      const e = bot.world.entities.get(this.entityId)
+      if (!e) return hits ? `攻击 ${hits} 次后 ${type} 消失 (可能已死亡)${chased ? `, 追了 ${chased} 次` : ''}` : `${type}#${this.entityId} 已经不在了`
+      if (Date.now() - t0 > limit) throw new Error(`${Math.round(limit / 1000)}s 内只打中 ${hits} 次 (追不上?)`)
+      const eye = eyeOf(bot)
+      const center = { x: e.x, y: e.y + size.h / 2, z: e.z }
+      const inReach = entityBoxDist(eye, e, size.w, size.h) <= MELEE_REACH && canSeePoint(bot.world, eye, center)
+      if (!inReach) {
+        // 靠近一小段再重新判断 (目标会动, 不一次走到底)
+        const d0 = Math.hypot(e.x - bot.pos.x, e.z - bot.pos.z)
+        const mv = await this.subMove({ x: e.x, y: Math.floor(e.y + 0.2), z: e.z }, { tolerance: 1, timeoutMs: 2500 })
+        chased++
+        const e2 = bot.world.entities.get(this.entityId)
+        const d1 = e2 ? Math.hypot(e2.x - bot.pos.x, e2.z - bot.pos.z) : 0
+        if (mv.status === 'failed' && d1 >= d0 - 0.3) {
+          if (++stuck >= 4) throw new Error(`走不到 ${type} 身边: ${mv.detail}${hits ? ` (已打中 ${hits} 次)` : ''}`)
+        } else stuck = 0
+        continue
+      }
+      const wait = lastHit + cd - Date.now()
+      if (wait > 0) { faceTowards(bot, center.x, center.y, center.z); await this.sleep(Math.min(wait, 200)); continue }
+      faceTowards(bot, center.x, center.y, center.z)
+      bot.reflex.lowerShield() // 举着盾不能攻击
+      bot.client.write('attack', { entityId: this.entityId }) // 26.3: 攻击是独立的 attack 包
+      bot.client.write('arm_animation', { hand: 'main_hand' })
+      hits++
+      lastHit = Date.now()
+    }
+    return `攻击 ${type} ${hits} 次 (${weapon ? `用 ${weapon}` : '空手'}, 间隔 ${cd}ms)${chased ? `, 途中追了 ${chased} 次` : ''}`
+  }
+}
 
 /** 满弓需要 20 tick; 多留 2 tick 余量 (服务器按它自己的 tick 计时) */
 const FULL_DRAW_MS = 1150

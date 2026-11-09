@@ -9,10 +9,10 @@ import { AsyncAction } from '../actions/base.js'
 import { MoveToAction } from '../actions/actions.js'
 import { eatOnce, bestFood, SleepAction } from '../actions/tasks.js'
 import { standableCell } from '../actions/astar.js'
-import { isHostile, isRanged, weaponScore, isNight, isWatery, isProjectile, entitySize } from '../game/knowledge.js'
+import { isHostile, isRanged, weaponScore, isNight, isWatery, isProjectile, entitySize, attackCooldownMs } from '../game/knowledge.js'
 import { projectileEta } from '../game/ballistics.js'
 import { EquipAction } from '../actions/tasks.js'
-import { ShootAction, canShoot, solveShot } from '../actions/combat.js'
+import { ShootAction, AttackAction, canShoot, solveShot } from '../actions/combat.js'
 import { FLYING } from '../game/knowledge.js'
 
 /** 会拉弓/上弩的远程怪 (living_entity_flags bit0 = 正在使用物品) */
@@ -30,7 +30,8 @@ export interface Policy {
   avoidHazards: boolean
   /** 天黑且空闲时回家 (需设 home), 家附近有床就睡 */
   nightShelter: boolean
-  home: { x: number, y: number, z: number } | null
+  /** 家 (dimension 缺省 = 主世界, 兼容旧存档) */
+  home: { x: number, y: number, z: number, dimension?: string } | null
   /** 死亡后自动复活 (关掉则停在死亡界面, 由 act{type:"respawn"} 手动复活) */
   autoRespawn: boolean
   /** 自动举盾 (副手有盾时): 箭飞来/骷髅拉弓/苦力怕点燃/近身怪 → 面向威胁格挡 */
@@ -38,6 +39,9 @@ export interface Policy {
   /** 远程: auto = 战斗时按情况用弓 (需弓+箭); never = 只近战 */
   ranged: 'auto' | 'never'
 }
+
+/** home 所在维度 (旧存档没记维度的按主世界) */
+export const homeDimension = (h: { dimension?: string }) => h.dimension ?? 'minecraft:overworld'
 
 export const DEFAULT_POLICY: Policy = { autoEat: true, eatAt: 14, combat: 'defend', fleeHealth: 8, avoidHazards: true, nightShelter: false, home: null, autoRespawn: true, shield: true, ranged: 'auto' }
 
@@ -193,6 +197,8 @@ export class Reflex {
           // 在吃东西/挖掘时手被占用: 挖掘让路 (打断), 吃东西就等吃完
           if (this.state !== 'eating') {
             const prim = bot.activeAction
+            // LLM 自己正在近战/射击: 不打断也不抢着砍 (它会追着打)
+            if (prim && prim.status === 'running' && !prim.byReflex && (prim instanceof AttackAction || prim instanceof ShootAction)) return
             if (prim && prim.status === 'running' && !prim.byReflex && !(prim instanceof MoveToAction)) prim.cancel(`被反射打断: 迎战 ${target.e.type}`)
             this.fight(target.e.id, now)
             return
@@ -220,7 +226,8 @@ export class Reflex {
     }
 
     // 4) 夜间回家
-    if (p.nightShelter && p.home && !this.busy && isNight(bot.dayTime)) {
+    // 不在家所在维度 / 本维度睡床会爆炸 (下界/末地) 时不回家
+    if (p.nightShelter && p.home && !this.busy && isNight(bot.dayTime) && homeDimension(p.home) === bot.dimension && bot.dimInfo.bedWorks) {
       const night = Math.floor(bot.worldAge / 24000)
       const prim = bot.activeAction
       if (this.shelteredNight !== night && (!prim || prim.status !== 'running')) {
@@ -256,7 +263,7 @@ export class Reflex {
 
   private fight (entityId: number, now: number) {
     const bot = this.bot
-    if (now - this.lastAttackAt < 620) return // 剑冷却
+    if (now - this.lastAttackAt < attackCooldownMs(bot.inventory.held()?.name) - 30) return // 武器冷却 (剑 0.63s / 斧 1~1.25s)
     const e = bot.world.entities.get(entityId)
     if (!e) return
     if (this.state !== 'fighting') this.log(`迎战 ${e.type}#${e.id} (血 ${bot.health.toFixed(0)})`)
@@ -402,7 +409,7 @@ export class Reflex {
       for (const da of [0, 0.5, -0.5, 1, -1]) {
         const x = Math.floor(bot.pos.x + Math.cos(ang + da) * dist), z = Math.floor(bot.pos.z + Math.sin(ang + da) * dist)
         if (!bot.world.getChunk(x >> 4, z >> 4)) continue
-        const y = bot.world.highestBlockY(x, z) + 1
+        const y = bot.world.groundY(x, z, bot.pos.y) + 1 // 下界: 自己高度附近的地面, 不是顶棚上面
         if (standableCell(bot.world, x, y, z)) return { x, y, z }
       }
     }

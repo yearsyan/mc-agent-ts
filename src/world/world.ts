@@ -67,15 +67,24 @@ const NON_SOLID = new Set([
 ])
 
 export class World {
+  /** 当前维度的高度范围 (主世界 -64..320, 下界/末地 0..256; 由 resetDimension 按 dimension_type 设置) */
   min_y = -64
   world_height = 384
+  /** 当前维度有基岩顶棚 (下界): 顶视最高方块是顶棚, 找地面要从自己高度附近找 */
+  hasCeiling = false
   private chunks = new Map<string, any>()
   entities = new Map<number, TrackedEntity>()
   fabricRegistries = new Map<string, Set<string>>()
   private entityNameById: Map<number, string> = buildEntityNameIndex()
 
-  setLoginInfo (_loginPacket: any) {
-    // 26.3 高度固定 -64..320; 如后续需要可从维度 codec 解析
+  /** 进入 (新) 维度: 清空区块与实体 (服务器不会为旧维度发卸载包), 换成新维度的高度 */
+  resetDimension (minY: number, height: number, hasCeiling: boolean) {
+    this.chunks.clear()
+    this.entities.clear()
+    this.lastCx = NaN; this.lastChunk = null
+    this.min_y = minY
+    this.world_height = height
+    this.hasCeiling = hasCeiling
   }
 
   // ---------- chunk ----------
@@ -155,6 +164,24 @@ export class World {
       const data = sections[si].data
       for (let ly = 15; ly >= 0; ly--) {
         if (!AIR_STATES.has(data.get((ly << 8) | (lz << 4) | lx))) return this.min_y + si * 16 + ly
+      }
+    }
+    return this.min_y - 1
+  }
+
+  /**
+   * 某列的地面高度 (返回地面方块的 y, 站立格 = +1)。
+   * 无顶棚维度 = 最高方块; 有顶棚 (下界) 时取 nearY 附近 (±16) 能站的格, 免得选到 y=128 的顶棚上面。
+   * 有顶棚又找不到时返回 min_y-1 (调用方按"没有"处理)。
+   */
+  groundY (x: number, z: number, nearY: number): number {
+    if (!this.hasCeiling) return this.highestBlockY(x, z)
+    const free = (y: number) => { const n = this.getBlock(x, y, z)?.name; return !!n && !this.isSolid(x, y, z) && n !== 'lava' && !n.includes('fire') }
+    const ny = Math.floor(nearY)
+    for (let d = 0; d <= 16; d++) {
+      for (const y of d ? [ny + d, ny - d] : [ny]) {
+        if (!this.isSolid(x, y - 1, z) || !free(y) || !free(y + 1)) continue
+        return y - 1
       }
     }
     return this.min_y - 1

@@ -22,6 +22,12 @@ python3 scripts/mcp_call.py <角色|admin> tools/call '{"name":"get_scene","argu
 - 配置目录 `~/.mc-agent/`（`MC_AGENT_HOME` 环境变量可覆盖）：`tokens.json`（角色↔token）、`policies.json`（反射策略持久化）、`logs/`（操作日志 JSONL）
 - token 即角色：admin 管全部角色（工具需传 name）；普通角色 token 自动绑定该角色，tools/list 按角色过滤
 
+## 部署（本机）
+
+- 服务由 systemd 用户单元托管：`~/.config/systemd/user/mc-agent.service`（`API_HOST=0.0.0.0`，依赖 `minecraft.service` 本地测试服，`Restart=on-failure`）
+- **重启/上线新代码用 `systemctl --user restart mc-agent`**，别用 `pnpm stop && pnpm start`：stop 的 SIGKILL 会触发 systemd 5 秒后自动重启（窗口内手动 start 会 EADDRINUSE），且手动 start 不带 `API_HOST` 只绑 127.0.0.1，会丢远程 WebUI 访问
+- 看日志：`journalctl --user -u mc-agent -f`
+
 ## 架构速览
 
 - `src/conn/` — bot.ts（连接/tick 门控/动作调度/聊天/死亡）、reflex.ts（反射层，每 tick 保命行为）、inventory.ts

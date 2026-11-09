@@ -77,6 +77,15 @@ export function canHarvest (blockName: string, item: string | null): boolean {
   return id !== undefined && !!tools[id]
 }
 
+const HARVEST_LEVEL: Record<string, number> = { wooden: 0, golden: 0, stone: 1, copper: 1, iron: 2, diamond: 3, netherite: 4 }
+/** 能让方块掉落的工具 (按等级从低到高); 空数组 = 任何工具/空手都会掉落 */
+export function harvestToolNames (blockName: string): string[] {
+  const tools = blockInfo(blockName)?.harvestTools
+  if (!tools) return []
+  return Object.keys(tools).map(id => itemName(Number(id)))
+    .sort((a, b) => (HARVEST_LEVEL[a.split('_')[0]] ?? 9) - (HARVEST_LEVEL[b.split('_')[0]] ?? 9))
+}
+
 /** 从候选物品中挑最佳挖掘工具; 返回 null 表示空手最好 */
 export function bestToolFor (blockName: string, candidates: { slot: number, name: string }[]): { slot: number | null, name: string | null, ticks: number, harvest: boolean } {
   const score = (name: string | null) => (canHarvest(blockName, name) ? 0 : 1e7) + digTicks(blockName, name)
@@ -90,7 +99,45 @@ export function bestToolFor (blockName: string, candidates: { slot: number, name
   return { ...best, ticks: digTicks(blockName, best.name), harvest: canHarvest(blockName, best.name) }
 }
 
+// ---------- 自然 / 人造方块 ----------
+
+const NATURAL_NAMES = new Set([
+  'stone', 'deepslate', 'cobblestone', 'cobbled_deepslate', 'granite', 'diorite', 'andesite', 'tuff', 'calcite',
+  'dripstone_block', 'pointed_dripstone', 'dirt', 'coarse_dirt', 'rooted_dirt', 'grass_block', 'podzol', 'mycelium',
+  'mud', 'clay', 'sand', 'red_sand', 'gravel', 'suspicious_sand', 'suspicious_gravel', 'sandstone', 'red_sandstone',
+  'terracotta', 'netherrack', 'soul_sand', 'soul_soil', 'basalt', 'blackstone', 'end_stone', 'magma_block',
+  'snow', 'snow_block', 'powder_snow', 'ice', 'packed_ice', 'blue_ice', 'moss_block', 'pale_moss_block', 'sculk', 'sculk_vein',
+  'crying_obsidian', 'amethyst_block', 'budding_amethyst', 'glowstone', 'nether_wart_block', 'warped_wart_block',
+  'shroomlight', 'mangrove_roots', 'muddy_mangrove_roots', 'bedrock', 'obsidian', 'cobweb', 'bone_block',
+])
+const DYES = 'white|orange|magenta|light_blue|yellow|lime|pink|gray|light_gray|cyan|purple|blue|brown|green|red|black'
+const NATURAL_RE = new RegExp(`(_ore$|^(?!stripped_).*_(log|stem)$|_leaves$|_mushroom_block$|^mushroom_stem$|_nylium$|^infested_|^(${DYES})_terracotta$)`)
+
+/**
+ * 自然生成的地形方块 (石头/泥土/矿石/树干/树叶…); 其余视为人造 (木板/砖/玻璃/羊毛/台阶/楼梯…, 可能是别人的建筑)。
+ * 圆石/泥土也算自然: bot 自己垫脚用的就是它们。
+ */
+export function isNaturalBlock (name: string): boolean {
+  return NATURAL_NAMES.has(name) || NATURAL_RE.test(name)
+}
+
 const WEAPON_DAMAGE: Record<string, number> = { sword: 4, axe: 6 }
+
+/** 原版攻击速度 (次/秒): 冷却没转满就挥, 伤害按比例打折 */
+function attackSpeed (item: string | null | undefined): number {
+  if (!item) return 4
+  if (item === 'trident') return 1.1
+  if (item === 'mace') return 0.6
+  const k = toolKind(item), tier = item.split('_')[0]
+  if (k === 'sword') return 1.6
+  if (k === 'axe') return tier === 'iron' ? 0.9 : ['golden', 'diamond', 'netherite'].includes(tier) ? 1.0 : 0.8
+  if (k === 'pickaxe') return 1.2
+  if (k === 'shovel') return 1.0
+  if (k === 'hoe') return ({ wooden: 1, golden: 1, stone: 2, copper: 2, iron: 3, diamond: 4, netherite: 4 } as Record<string, number>)[tier] ?? 1
+  return 4
+}
+/** 两次攻击间隔 (ms): 冷却转满再挥, 打满伤害 */
+export const attackCooldownMs = (item: string | null | undefined) => Math.ceil(1000 / attackSpeed(item)) + 30
 /** 近战武器评分 (越大越好); 非武器 0 */
 export function weaponScore (item: string): number {
   const k = toolKind(item)

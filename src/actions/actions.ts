@@ -3,12 +3,12 @@
  * act() -> actionId; 状态机式动作每 tick 由 BotAgent 驱动 step(), 多步动作用 AsyncAction.run()。
  */
 import type { BotAgent } from '../conn/bot.js'
-import { findPath, placementsIn, isOpenable, isDiggable, type PathNode } from './astar.js'
-import { RouteLog, settleWithRoute, proposalText, type RouteProposal, type TerrainEdit, type Pos3 } from './route.js'
+import { findPath, placementsIn, isOpenable, isDiggable, MAX_WATER_DROP, type PathNode } from './astar.js'
+import { RouteLog, settleWithRoute, proposalText, judgeProposal, posKey, type RouteProposal, type DigStep, type Pos3, type Approval } from './route.js'
 import { Action, AsyncAction } from './base.js'
 import { fluidHeight } from '../physics/runner.js'
-import { holdSlot, holdItem, holdNothing, prepareHeld, placeBlockAt, faceTowards, reachTo, closeContainer } from './hands.js'
-import { bestToolFor, toolKind, weaponScore, blockProps, SCAFFOLD_BLOCKS, isWatery } from '../game/knowledge.js'
+import { holdSlot, holdItem, holdNothing, prepareHeld, placeBlockAt, faceTowards, reachTo, closeContainer, canReach, boxDist, eyeOf, REACH } from './hands.js'
+import { bestToolFor, toolKind, weaponScore, blockProps, blockInfo, SCAFFOLD_BLOCKS, isWatery, isNaturalBlock } from '../game/knowledge.js'
 
 export { Action, AsyncAction } from './base.js'
 export type { ActionStatus } from './base.js'
@@ -26,24 +26,56 @@ export function scaffoldSlots (bot: BotAgent) {
 }
 const scaffoldCount = (bot: BotAgent) => scaffoldSlots(bot).reduce((n, h) => n + h.item.count, 0)
 
-/** 挖穿航点要挖掉的格 (handleDig 与方案描述共用, 保证方案里列的就是实际会挖的) */
-function digTargets (bot: BotAgent, wp: PathNode): { y: number, name: string }[] {
+/**
+ * 挖穿航点要挖掉的格 (handleDig 与方案描述共用, 保证方案里列的就是实际会挖的)。
+ * optional = 楼梯式上挖最上面那格 (只为起跳留头顶空间, 挖不动/未获批就不挖)。
+ */
+function digTargets (bot: BotAgent, wp: PathNode, allowed?: (x: number, y: number, z: number) => boolean): { y: number, name: string, optional: boolean }[] {
   const ys = wp.dig === 'up' ? [wp.y, wp.y + 1, wp.y + 2] : wp.dig === 'down' ? [wp.y] : [wp.y, wp.y + 1]
-  const out: { y: number, name: string }[] = []
+  const out: { y: number, name: string, optional: boolean }[] = []
   for (const y of ys) {
     const b = bot.world.getBlock(wp.x, y, wp.z)
     if (!b || !blocksWay(b.name)) continue
-    // 楼梯式上挖最上面那格只为起跳留头顶空间: 不可挖的 (箱子/基岩等) 不动它
-    if (y === wp.y + 2 && !isDiggable(b.name)) continue
-    out.push({ y, name: b.name })
+    const optional = y === wp.y + 2
+    if (optional && (!isDiggable(b.name) || (allowed && !allowed(wp.x, y, wp.z)))) continue
+    out.push({ y, name: b.name, optional })
   }
   return out
 }
 
-/** 把一条改地形的路径整理成给 LLM 确认的方案 */
+// ---------- 挖掘代价 (按背包工具) ----------
+
+/** 走一格约 0.23s: 挖掘秒数 × 4.3 折算成"走几格" */
+const WALK_PER_S = 4.3
+/** 人造方块 (木板/砖/玻璃…) 额外代价: 能绕就绕, 实在要挖方案里会标"不推荐" */
+const ARTIFICIAL_PENALTY = 40
+
+/** 用背包里最合适的工具挖这种方块: 工具/耗时/是否自然方块 */
+function digInfo (name: string, tools: { slot: number, name: string }[]): Omit<DigStep, 'block' | 'pos'> {
+  const t = bestToolFor(name, tools)
+  return {
+    tool: t.name,
+    secs: Number.isFinite(t.ticks) ? +(t.ticks / 20 + 0.15).toFixed(2) : Infinity, // +0.15: 转身/发包
+    natural: isNaturalBlock(name),
+    ...(t.harvest ? {} : { noDrop: true as const }),
+  }
+}
+
+/** 给 A* 的挖掘代价函数 (按当前背包工具, 每次规划生成一次) */
+function makeDigCost (bot: BotAgent) {
+  const tools = toolCandidates(bot)
+  return (name: string) => {
+    const d = digInfo(name, tools)
+    if (!Number.isFinite(d.secs)) return null
+    return d.secs * WALK_PER_S + (d.natural ? 0 : ARTIFICIAL_PENALTY)
+  }
+}
+
+/** 把一条改地形的路径整理成给 LLM 确认的方案 (带工具/耗时/推荐) */
 function describeRoute (bot: BotAgent, path: PathNode[], option: RouteProposal['option']): RouteProposal {
-  const dig: TerrainEdit[] = []
-  for (const n of path) if (n.dig) for (const c of digTargets(bot, n)) dig.push({ block: c.name, pos: [n.x, c.y, n.z] })
+  const tools = toolCandidates(bot)
+  const dig: DigStep[] = []
+  for (const n of path) if (n.dig) for (const c of digTargets(bot, n)) dig.push({ block: c.name, pos: [n.x, c.y, n.z], ...digInfo(c.name, tools) })
   const place = path.filter(n => n.place).map(n => ({ pos: [n.x, n.y - 1, n.z] as Pos3, how: n.place! }))
   // 按 placeScaffold 的用法 (按优先级一组组用完) 估算消耗
   const uses: Record<string, number> = {}
@@ -54,17 +86,22 @@ function describeRoute (bot: BotAgent, path: PathNode[], option: RouteProposal['
     uses[s.item.name] = (uses[s.item.name] ?? 0) + k
     left -= k
   }
-  return {
+  return judgeProposal({
     option,
     allow: { ...(option !== 'place' ? { allow_dig: true as const } : {}), ...(option !== 'dig' ? { allow_place: true as const } : {}) },
-    steps: path.length - 1, dig, place,
+    steps: path.length - 1, dig,
+    ...(dig.length ? { dig_s: +dig.reduce((t, d) => t + d.secs, 0).toFixed(1) } : {}),
+    place,
     ...(place.length ? { uses } : {}),
     ...(left ? { shortage: left } : {}),
-  }
+  })
 }
 
-/** 一次搜索的权限: 能否挖, 最多放几块 */
-interface Perm { dig: boolean, place: number }
+/** 一次搜索的权限: 能否挖, 最多放几块, 落地水高度 (缺省 = 本次规划按背包算的), 是否限于已批准的格 */
+interface Perm { dig: boolean, place: number, water?: number, restrict?: boolean }
+
+/** move_to / go_home 单次最多走多少格 (实际路程): 走太久 agent 感知不到途中情况, 到了先停下汇报 */
+export const MAX_MOVE_DIST = 128
 /** 算"搭方块"方案时假设的方块数 (背包不够也给出方案并注明缺多少) */
 const PROPOSAL_SCAFFOLD = 64
 
@@ -83,6 +120,10 @@ export interface MoveOptions {
   allowPlace?: boolean
   /** 走不通时计算挖/搭方案放进 extra.proposals (默认 true; 反射逃跑等用不上的关掉省算力) */
   propose?: boolean
+  /** 按方案确认 (confirm): 只允许挖/放方案里列出的格 (allowDig/allowPlace 是整趟都允许) */
+  approved?: Approval
+  /** 单次最多走多少格 (实际路程); 到了就在安全落脚点停下, extra.arrived=false。不给 = 不限 */
+  maxDistance?: number
 }
 
 /** 单段规划的最远水平距离; 更远的目标分段前进 (每段重新规划, 区块会随移动加载) */
@@ -103,6 +144,12 @@ export class MoveToAction extends Action {
   /** 当前段是中途点 (目标太远或未加载) */
   private segmenting = false
   private segments = 0
+  /** 实际走过的水平路程 (单次上限用) */
+  private traveled = 0
+  private lastPos: { x: number, z: number } | null = null
+  /** 按方案确认时: 只能挖/放这些格 (整趟允许或没批准时为 undefined) */
+  private readonly digAllowed?: (x: number, y: number, z: number) => boolean
+  private readonly placeAllowed?: (x: number, y: number, z: number) => boolean
   private tol: number
   // 挖掘子状态
   private digY: number | null = null
@@ -122,6 +169,11 @@ export class MoveToAction extends Action {
   private planner: Generator<void, void, void> | null = null
   /** 实际改动的地形 */
   readonly route = new RouteLog()
+  /** 本次规划的挖掘代价函数 / 允许的落地水高度 (随背包变化, 每次规划重算) */
+  private digCost: (name: string) => number | null = () => 2
+  private waterDropMax = 0
+  /** 落地水执行状态 (key = 航点坐标) */
+  private wd: { key: string, phase: 'prep' | 'fall' | 'pickup' | 'done', pouredAt: number, landedAt: number, tries: number, lastTry: number } | null = null
 
   constructor (private bot: BotAgent, private target: { x: number, y?: number, z: number }, private opts: MoveOptions = {}) {
     super('move_to')
@@ -129,6 +181,9 @@ export class MoveToAction extends Action {
     const dist = Math.hypot(target.x - bot.pos.x, target.z - bot.pos.z)
     this.deadline = Date.now() + (opts.timeoutMs ?? Math.max(90_000, dist * 1500))
     this.handOwner = `move#${this.id}`
+    const ap = opts.approved
+    if (ap && !opts.allowDig) this.digAllowed = (x, y, z) => ap.dig.has(posKey(x, y, z))
+    if (ap && !opts.allowPlace) this.placeAllowed = (x, y, z) => ap.place.has(posKey(x, y, z))
   }
 
   private standableAt (x: number, y: number, z: number) {
@@ -163,7 +218,8 @@ export class MoveToAction extends Action {
 
   /** 一次 A* 搜索; 带放置时方块不够或没搜到, 允许挖则不放方块再试一次 */
   private search (from: PathNode, t: { to: PathNode, tol: number, maxExp?: number }, perm: Perm): PathNode[] | null {
-    const run = (place: number) => findPath(this.bot.world, from, t.to, { scaffold: place, allowDig: perm.dig, tolerance: t.tol, maxExpansions: t.maxExp })
+    const run = (place: number) => findPath(this.bot.world, from, t.to, { scaffold: place, allowDig: perm.dig, tolerance: t.tol, maxExpansions: t.maxExp, digCost: this.digCost, waterDrop: perm.water ?? this.waterDropMax,
+      ...(perm.restrict ? { digAllowed: this.digAllowed, placeAllowed: this.placeAllowed } : {}) })
     let p = run(perm.place)
     if (perm.place > 0 && (!p || placementsIn(p) > perm.place)) p = perm.dig ? run(0) : null
     return p
@@ -192,7 +248,8 @@ export class MoveToAction extends Action {
           const dd = Math.min(d, dist)
           const sx = Math.floor(from.x + Math.cos(base + da) * dd), sz = Math.floor(from.z + Math.sin(base + da) * dd)
           if (!w.getChunk(sx >> 4, sz >> 4)) continue
-          const top = w.highestBlockY(sx, sz)
+          const top = w.groundY(sx, sz, from.y) // 下界: 自己高度附近的地面, 不是顶棚上面
+          if (top < w.min_y) continue
           const land = w.getBlock(sx, top, sz)?.name !== 'water'
           cands.push({ p: { x: sx, y: this.adaptY(sx, top + 1, sz), z: sz }, land, rank: -dd + Math.abs(da) * 20 })
         }
@@ -208,8 +265,18 @@ export class MoveToAction extends Action {
 
     const have = scaffoldCount(bot)
     const allowDig = !!this.opts.allowDig
+    this.digCost = makeDigCost(bot)
+    // 有水桶且水不会蒸发 (不在下界): 允许 5..32 格的下落, 落地前倒水缓冲, 落地后收回 (不算改地形, 不用 allow 开关)
+    this.waterDropMax = bot.inventory.count('water_bucket') > 0 && !bot.dimInfo.waterEvaporates ? MAX_WATER_DROP : 0
+    const ap = this.opts.approved
     const tiers: Perm[] = [{ dig: false, place: 0 }]
-    const granted: Perm | null = allowDig || (this.opts.allowPlace && have > 0) ? { dig: allowDig, place: this.opts.allowPlace ? have : 0 } : null
+    // 整趟允许 (allow_*) 的权限; 方案算重复时只看它
+    const broad: Perm | null = allowDig || (this.opts.allowPlace && have > 0) ? { dig: allowDig, place: this.opts.allowPlace ? have : 0 } : null
+    // 实际搜索用的: 整趟允许 ∪ 已批准的格
+    const apPlace = ap ? Math.min(have, ap.place.size) : 0
+    const granted: Perm | null = broad || (ap && (ap.dig.size || apPlace))
+      ? { dig: allowDig || !!ap?.dig.size, place: this.opts.allowPlace ? have : apPlace, restrict: !!ap }
+      : null
     if (granted) tiers.push(granted)
     let first = true
     for (const tier of tiers) {
@@ -222,13 +289,19 @@ export class MoveToAction extends Action {
     }
 
     const t0 = targets[0].to
-    const allowed = [allowDig && '挖掘', this.opts.allowPlace && (have > 0 ? '搭方块' : '搭方块 (但背包没有垫脚方块)')].filter(Boolean).join('/')
-    const head = `无可行路径 ${from.x},${from.y},${from.z} -> ${t0.x},${t0.y},${t0.z}${this.segmenting ? ' (远程中途点, 已试多个方向)' : ''}${allowed ? ` (已允许${allowed})` : ' (只走现成的路, 不挖不搭)'}`
+    const allowed = [allowDig && '挖掘', this.opts.allowPlace && (have > 0 ? '搭方块' : '搭方块 (但背包没有垫脚方块)'),
+      ap && `方案 ${ap.ids.join('/')} 列出的改动${ap.place.size > have ? ` (但垫脚方块只有 ${have} 个, 方案要 ${ap.place.size} 个)` : ''}`].filter(Boolean).join('/')
+    // 分段时方案只通往中途点: 说清楚, 免得 agent 以为是最终目标
+    const remain = Math.round(Math.hypot(tx - t0.x, tz - t0.z))
+    const where = this.segmenting
+      ? `${from.x},${from.y},${from.z} -> 中途点 ${t0.x},${t0.y},${t0.z} (最终目标 ${tx},${tz} 太远/未加载, 分段走; 中途点离最终目标还有 ${remain} 格, 已试多个方向)`
+      : `${from.x},${from.y},${from.z} -> ${t0.x},${t0.y},${t0.z}`
+    const head = `无可行路径 ${where}${allowed ? ` (已允许${allowed})` : ' (只走现成的路, 不挖不搭)'}`
     if (this.opts.propose === false) { this.fail(head); return }
 
     // 算方案 (只针对首选目标): 已获准且试过的权限不再重复算
     const H = Math.max(have, PROPOSAL_SCAFFOLD)
-    const covered = (m: Perm) => !!granted && (granted.dig || !m.dig) && granted.place >= m.place
+    const covered = (m: Perm) => !!broad && (broad.dig || !m.dig) && broad.place >= m.place
     const proposals: RouteProposal[] = []
     const modes: [RouteProposal['option'], Perm][] = [['dig', { dig: true, place: 0 }], ['place', { dig: false, place: H }]]
     for (const [option, m] of modes) {
@@ -243,10 +316,23 @@ export class MoveToAction extends Action {
       const p = this.search(from, targets[0], { dig: true, place: H })
       if (p && p.length) proposals.push(describeRoute(bot, p, 'dig+place'))
     }
+    // 没水桶时: 看看有水桶能不能直接跳下去 (高处下不来的常见情况), 有的话提示
+    let waterHint = ''
+    if (!this.waterDropMax && !bot.dimInfo.waterEvaporates) {
+      yield
+      const p = this.search(from, targets[0], { dig: false, place: 0, water: MAX_WATER_DROP })
+      const n = p?.filter(x => x.waterDrop).length ?? 0
+      if (n) waterHint = `\n另: 背包有水桶 (water_bucket) 的话不用改地形, 直接从高处跳下 (${n} 处, 落地前倒水缓冲、落地后收回)`
+    }
+    // 推荐的排前面 (同样推荐时挖优先: 自然方块 + 有合适工具时挖比搭快, 也不用消耗方块)
+    proposals.sort((a, b) => Number(b.recommended) - Number(a.recommended))
+    // 编号 + 注明通往哪里, 存到 bot 上供 confirm 引用
+    proposals.forEach((p, i) => { p.id = `p${this.id}-${i + 1}`; p.toward = { x: t0.x, y: t0.y, z: t0.z, ...(this.segmenting ? { waypoint: true as const } : {}) } })
+    bot.rememberProposals(proposals)
     this.extra = { ...this.extra, proposals }
     this.fail(proposals.length
-      ? `${head}。可选方案 (确认后在原动作参数里加上对应开关重新下达; 也可以换目标或不动):\n${proposals.map(proposalText).join('\n')}`
-      : `${head}。挖/搭方案也找不到 (可能被岩浆/水/不可挖方块隔开, 或目标太远/悬空)`)
+      ? `${head}。可选方案 (也可以换目标或不动)${this.segmenting ? '; 方案只通往中途点, 走过去后可能还有新的障碍' : ''}:\n${proposals.map(proposalText).join('\n')}${waterHint}`
+      : `${head}。挖/搭方案也找不到 (可能被岩浆/水/不可挖方块隔开, 或目标太远/悬空)${waterHint}`)
   }
 
   private usePath (path: PathNode[]) {
@@ -266,6 +352,8 @@ export class MoveToAction extends Action {
     if (this.planner) { this.halt(); this.advancePlanner(); return }
     if (!this.path) return
     const bot = this.bot
+    if (this.lastPos) { const d = Math.hypot(bot.pos.x - this.lastPos.x, bot.pos.z - this.lastPos.z); if (d < 8) this.traveled += d } // 更大的跳变是传送
+    this.lastPos = { x: bot.pos.x, z: bot.pos.z }
     if (nowMs > this.deadline) { this.stopMoving(); return this.fail('超时') }
     if (nowMs - this.lastProgressAt > 18000) { this.stopMoving(); return this.fail('超时: 18 秒无进展') }
 
@@ -282,6 +370,9 @@ export class MoveToAction extends Action {
     // ---- 挖穿航点 ----
     if (wp.dig && this.handleDig(wp, nowMs)) return
 
+    // ---- 高处跳下: 落地前倒水缓冲, 落地后收回 ----
+    if (wp.waterDrop && this.handleWaterDrop(wp, nowMs)) return
+
     // ---- 搭桥: 走上去前先在脚下放方块 ----
     if (wp.place === 'bridge' && this.handleBridge(wp, nowMs)) return
 
@@ -296,10 +387,14 @@ export class MoveToAction extends Action {
     const arriveR = finalWp ? (this.tol === 0 && !this.segmenting ? 0.4 : 2.0) : (wp.climb ? 0.6 : 1.6)
     if (distWp < arriveR && vertOk && !(finalWp && this.tol === 0 && !bot.onGround && !inWater && !wp.climb)) {
       if (finalWp) {
-        if (this.segmenting) { this.segments++; this.lastProgressAt = nowMs; this.plan(); return }
+        if (this.segmenting) {
+          if (this.reachedCap()) return
+          this.segments++; this.lastProgressAt = nowMs; this.plan(); return
+        }
         this.stopMoving()
         return this.finish(`到达 ${wp.x},${wp.y},${wp.z}${this.segments ? ` (分 ${this.segments + 1} 段)` : ''}`)
       }
+      if (this.reachedCap()) return
       this.wpIdx++
       this.lastWpProgressAt = nowMs
       return
@@ -307,7 +402,7 @@ export class MoveToAction extends Action {
     // 航点跳跃: 下一航点已比当前近则跳过 (特殊航点不跳)
     if (!finalWp && !wp.climb && !wp.swim) {
       const nxt = this.path[this.wpIdx + 1]
-      if (!nxt.place && !nxt.dig && !nxt.door && !nxt.climb) {
+      if (!nxt.place && !nxt.dig && !nxt.door && !nxt.climb && !nxt.waterDrop) {
         const dNext = Math.hypot(nxt.x + 0.5 - bot.pos.x, nxt.z + 0.5 - bot.pos.z)
         if (dNext < distWp - 0.3 && Math.abs(nxt.y - bot.pos.y) < 1.2) { this.wpIdx++; this.lastWpProgressAt = nowMs; return }
       }
@@ -359,6 +454,22 @@ export class MoveToAction extends Action {
     }
   }
 
+  /**
+   * 单次路程到上限: 在安全落脚点 (地上, 不在水里/梯子上) 停下, 汇报离目标还有多远, 由 agent 看过情况再继续。
+   * 返回 true = 已结束。
+   */
+  private reachedCap (): boolean {
+    const max = this.opts.maxDistance
+    if (!max || this.traveled < max) return false
+    const bot = this.bot
+    if (!bot.onGround || bot.physics.inWater || bot.swimming) return false
+    const rem = Math.round(Math.hypot(this.target.x - bot.pos.x, this.target.z - bot.pos.z))
+    this.stopMoving()
+    this.extra = { ...this.extra, arrived: false, traveled: Math.round(this.traveled), remaining: rem }
+    this.finish(`未到终点: 本次已走 ${Math.round(this.traveled)} 格 (单次上限 ${max} 格), 停在 ${Math.floor(bot.pos.x)},${Math.floor(bot.pos.y)},${Math.floor(bot.pos.z)}, 离目标 (${Math.floor(this.target.x)},${Math.floor(this.target.z)}) 还有 ${rem} 格。先 get_scene / get_view 看看周围, 再 move_to 继续`)
+    return true
+  }
+
   /** 门/栅栏门关着: 停下, 右键打开; 返回 true 表示本 tick 在处理门 */
   private openDoorIfClosed (wp: PathNode, nowMs: number): boolean {
     const w = this.bot.world
@@ -383,7 +494,11 @@ export class MoveToAction extends Action {
   private handleDig (wp: PathNode, nowMs: number): boolean {
     const bot = this.bot
     if (this.digY === null) {
-      const next = digTargets(bot, wp)[0]
+      const cells = digTargets(bot, wp, this.digAllowed)
+      // 按方案确认时: 必须挖的格没获批 (地形变了/路径变了) → 不挖, 重新规划
+      const bad = this.digAllowed && cells.find(c => !c.optional && !this.digAllowed!(wp.x, c.y, wp.z))
+      if (bad) { this.halt(); this.plan(); return true }
+      const next = cells[0]
       if (!next) { bot.releaseHand(this.handOwner); return false } // 已挖好, 正常走过去
       this.digY = next.y; this.digName = next.name; this.digSentAt = 0; this.digTries = 0
     }
@@ -418,6 +533,90 @@ export class MoveToAction extends Action {
     if (nowMs % 300 < 50) bot.client.write('arm_animation', { hand: 'main_hand' })
     this.lastProgressAt = Math.max(this.lastProgressAt, nowMs - 15000)
     return true
+  }
+
+  /**
+   * 落地水 (wp = 落地格, 比当前低 5..32 格; 返回 true = 本 tick 由这里控制):
+   * prep 锁手、换上水桶 → fall 走下边缘, 眼睛够得着落地格顶面 (≤4.3) 时对准倒水 (本地世界先放上水, 物理按水里算)
+   * → pickup 落地后低头用空桶收回 (水还没来得及流开), 收不回就记进 route。
+   * 发 use_item 时服务器按上一个位置包 (= 当前 bot.pos) + 包里的朝向做射线, 所以用当前位置判断够不够得着。
+   */
+  private handleWaterDrop (wp: PathNode, nowMs: number): boolean {
+    const bot = this.bot, c = bot.physics.control
+    const key = `${wp.x},${wp.y},${wp.z}`
+    if (this.wd?.key !== key) this.wd = { key, phase: 'prep', pouredAt: 0, landedAt: 0, tries: 0, lastTry: 0 }
+    const wd = this.wd
+    if (wd.phase === 'done') return false
+    const target = { x: wp.x + 0.5, y: wp.y, z: wp.z + 0.5 } // 地面方块顶面中心
+    const eyeY = bot.pos.y + bot.eyeHeight
+    const landed = (bot.onGround || bot.physics.inWater) && bot.pos.y < wp.y + 0.6
+    c.sprint = false; c.sneak = false; c.jump = false; c.left = false; c.right = false
+
+    if (wd.phase === 'prep') {
+      this.halt()
+      if (!bot.tryLockHand(this.handOwner)) return true // 手被占用 (吃东西), 等
+      const slot = bot.inventory.find(s => s.name === 'water_bucket')[0]?.slot
+      if (slot === undefined) { this.fail('没有水桶了, 跳不下去 (超过 4 格会摔伤)'); return true }
+      if (!prepareHeld(bot, slot)) return true
+      wd.phase = 'fall'
+      this.lastProgressAt = nowMs
+    }
+
+    if (wd.phase === 'fall') {
+      if (landed) {
+        if (!wd.pouredAt) console.warn(`[${bot.name}] 落地水没来得及倒 @ ${key}`)
+        wd.phase = wd.pouredAt ? 'pickup' : 'done'
+        wd.landedAt = nowMs
+        if (wd.phase === 'done') { bot.releaseHand(this.handOwner); return false }
+      } else {
+        // 水平对准落地列 (走下边缘), 掉下去后停止前进防止撞墙
+        const dx = target.x - bot.pos.x, dz = target.z - bot.pos.z
+        const dh = Math.hypot(dx, dz)
+        c.forward = dh > 0.25
+        if (c.forward) bot.yaw = Math.atan2(-dx, dz) * 180 / Math.PI
+        const reach = Math.hypot(dx, eyeY - target.y, dz)
+        if (!wd.pouredAt && !bot.onGround && bot.pos.y > wp.y + 0.5 && reach <= 4.3) {
+          faceTowards(bot, target.x, target.y, target.z)
+          if (bot.inventory.held()?.name === 'water_bucket') {
+            bot.useItem('main_hand')
+            wd.pouredAt = nowMs
+            // 本地先放上水源, 物理模拟按水里减速 (服务器的方块更新稍后到, 以它为准)
+            const water = blockInfo('water')
+            if (water) bot.world.setBlock({ location: { x: wp.x, y: wp.y, z: wp.z }, stateId: water.defaultState ?? water.minStateId })
+          }
+        }
+        this.lastProgressAt = nowMs
+        return true
+      }
+    }
+
+    if (wd.phase === 'pickup') {
+      this.halt()
+      c.jump = false
+      const b = bot.world.getBlock(wp.x, wp.y, wp.z)
+      const isSource = b?.name === 'water' && blockProps(b.stateId).level === '0'
+      if (!isSource && bot.inventory.held()?.name === 'water_bucket') {
+        this.route.waterDrop(wp.x, wp.y, wp.z, true)
+        wd.phase = 'done'; bot.releaseHand(this.handOwner); return false
+      }
+      if (nowMs - wd.landedAt < 100) return true // 等落稳
+      if (nowMs - wd.lastTry > 250) {
+        if (++wd.tries > 8) {
+          // 收不回 (被冲走/服务器拒绝): 水留在原地, 记进 route 让 LLM 知道
+          this.route.waterDrop(wp.x, wp.y, wp.z, !isSource)
+          wd.phase = 'done'; bot.releaseHand(this.handOwner); return false
+        }
+        wd.lastTry = nowMs
+        const slot = bot.inventory.find(s => s.name === 'bucket')[0]?.slot
+        if (slot !== undefined && prepareHeld(bot, slot) && isSource) {
+          faceTowards(bot, wp.x + 0.5, wp.y + 0.5, wp.z + 0.5)
+          bot.useItem('main_hand')
+        }
+      }
+      this.lastProgressAt = nowMs
+      return true
+    }
+    return false
   }
 
   /** 搭桥: 目标格下方没支撑就放一块; 返回 true 表示本 tick 在放 */
@@ -585,8 +784,7 @@ export class DigAction extends AsyncAction {
     // 挖穿进岩浆是最常见的死法: 旁边/上方有岩浆就不挖
     const lavaSide = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]].find(([ox, oy, oz]) => bot.world.getBlock(x + ox, y + oy, z + oz)?.name === 'lava')
     if (lavaSide) throw new Error(`(${x},${y},${z}) 旁边有岩浆 (${x + lavaSide[0]},${y + lavaSide[1]},${z + lavaSide[2]}), 挖开会流出来, 不挖`)
-    const dist = reachTo(bot, x, y, z)
-    if (dist > 4.6) throw new Error(`距离 ${dist.toFixed(1)} 超出触及范围 4.5`)
+    if (!canReach(bot, x, y, z)) throw new Error(`距离 ${boxDist(eyeOf(bot), x, y, z).toFixed(1)} 超出触及范围 ${REACH}`)
     await this.until(() => bot.tryLockHand(this.owner), 5000, '手空闲')
     const tool = bestToolFor(b.name, toolCandidates(bot))
     if (!Number.isFinite(tool.ticks)) throw new Error(`${b.name} 不可破坏`)
@@ -625,8 +823,7 @@ export class PlaceAction extends AsyncAction {
     const { x, y, z, bot } = this
     const b = bot.world.getBlock(x, y, z)
     if (b && !AIRISH.has(b.name) && !isSoft(b.name) && b.name !== 'water') throw new Error(`(${x},${y},${z}) 已有方块 ${b.name}`)
-    const dist = reachTo(bot, x, y, z)
-    if (dist > 4.6) throw new Error(`距离 ${dist.toFixed(1)} 超出触及范围`)
+    if (!canReach(bot, x, y, z)) throw new Error(`距离 ${boxDist(eyeOf(bot), x, y, z).toFixed(1)} 超出触及范围 ${REACH}`)
     if (this.opts.item) await holdItem(this, bot, this.opts.item)
     else if (this.opts.hotbar !== undefined) await holdSlot(this, bot, 36 + this.opts.hotbar)
     const held = bot.inventory.held()
@@ -640,30 +837,6 @@ export class PlaceAction extends AsyncAction {
 }
 
 // ---------- 攻击 ----------
-
-export class AttackAction extends AsyncAction {
-  constructor (bot: BotAgent, private entityId: number, private maxHits = 3) { super(bot, 'attack') }
-
-  protected async run () {
-    const bot = this.bot
-    const weapons = bot.inventory.find(s => weaponScore(s.name) > 0).sort((a, b) => weaponScore(b.item.name) - weaponScore(a.item.name))
-    if (weapons.length) await holdSlot(this, bot, weapons[0].slot)
-    let hits = 0
-    while (hits < this.maxHits) {
-      const e = bot.world.entities.get(this.entityId)
-      if (!e) return hits ? `攻击 ${hits} 次后目标消失 (可能已死亡)` : `实体 ${this.entityId} 不存在`
-      const dist = Math.hypot(e.x - bot.pos.x, e.y + 0.9 - (bot.pos.y + 1.62), e.z - bot.pos.z)
-      if (dist > 3.6) { if (!hits) throw new Error(`距离 ${dist.toFixed(1)} 太远 (需 ≤3.5)`); return `攻击 ${hits} 次后目标离开触及范围` }
-      faceTowards(bot, e.x, e.y + 0.9, e.z)
-      bot.reflex.lowerShield() // 举着盾不能攻击
-      bot.client.write('attack', { entityId: this.entityId }) // 26.3: 攻击是独立的 attack 包
-      bot.client.write('arm_animation', { hand: 'main_hand' })
-      hits++
-      await this.sleep(650) // 剑的攻击冷却 ~0.625s
-    }
-    return `攻击 ${hits} 次${weapons.length ? ` (用 ${weapons[0].item.name})` : ''}`
-  }
-}
 
 // ---------- 库存 / 容器 ----------
 
@@ -681,8 +854,7 @@ export class OpenContainerAction extends AsyncAction {
   constructor (bot: BotAgent, private x: number, private y: number, private z: number) { super(bot, 'open_container') }
   protected async run () {
     const { bot, x, y, z } = this
-    const dist = reachTo(bot, x, y, z)
-    if (dist > 4.6) throw new Error(`距离 ${dist.toFixed(1)} 超出触及范围`)
+    if (!canReach(bot, x, y, z)) throw new Error(`距离 ${boxDist(eyeOf(bot), x, y, z).toFixed(1)} 超出触及范围 ${REACH}`)
     closeContainer(bot)
     await holdNothing(this, bot) // 防止把手里的方块放上去
     faceTowards(bot, x + 0.5, y + 0.5, z + 0.5)
@@ -691,6 +863,7 @@ export class OpenContainerAction extends AsyncAction {
     await this.until(() => bot.inventory.activeWindowId !== null, 3000, '容器打开')
     const w = bot.inventory.windows.get(bot.inventory.activeWindowId!)
     await this.until(() => (w?.slots.length ?? 0) > 0, 1500, '容器内容')
+    bot.openedContainer = { windowId: bot.inventory.activeWindowId!, block: bot.world.getBlock(x, y, z)?.name ?? '容器', x, y, z }
     return `容器已打开 (窗口${bot.inventory.activeWindowId}, ${w?.slots.length ?? 0} 槽)`
   }
 }
