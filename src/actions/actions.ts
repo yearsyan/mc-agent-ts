@@ -3,7 +3,8 @@
  * act() -> actionId; 状态机式动作每 tick 由 BotAgent 驱动 step(), 多步动作用 AsyncAction.run()。
  */
 import type { BotAgent } from '../conn/bot.js'
-import { findPath, placementsIn, isOpenable, type PathNode } from './astar.js'
+import { findPath, placementsIn, isOpenable, isDiggable, type PathNode } from './astar.js'
+import { RouteLog, settleWithRoute, proposalText, type RouteProposal, type TerrainEdit, type Pos3 } from './route.js'
 import { Action, AsyncAction } from './base.js'
 import { fluidHeight } from '../physics/runner.js'
 import { holdSlot, holdItem, holdNothing, prepareHeld, placeBlockAt, faceTowards, reachTo, closeContainer } from './hands.js'
@@ -14,6 +15,8 @@ export type { ActionStatus } from './base.js'
 
 const AIRISH = new Set(['air', 'cave_air', 'void_air'])
 const isSoft = (name: string) => ['snow', 'short_grass', 'tall_grass', 'fern', 'torch'].includes(name)
+/** 挡路、需要挖掉的方块 */
+const blocksWay = (name: string) => !AIRISH.has(name) && !isSoft(name) && name !== 'water'
 
 /** 背包里的垫脚方块 (按 SCAFFOLD_BLOCKS 优先级) */
 export function scaffoldSlots (bot: BotAgent) {
@@ -22,6 +25,48 @@ export function scaffoldSlots (bot: BotAgent) {
   return hits
 }
 const scaffoldCount = (bot: BotAgent) => scaffoldSlots(bot).reduce((n, h) => n + h.item.count, 0)
+
+/** 挖穿航点要挖掉的格 (handleDig 与方案描述共用, 保证方案里列的就是实际会挖的) */
+function digTargets (bot: BotAgent, wp: PathNode): { y: number, name: string }[] {
+  const ys = wp.dig === 'up' ? [wp.y, wp.y + 1, wp.y + 2] : wp.dig === 'down' ? [wp.y] : [wp.y, wp.y + 1]
+  const out: { y: number, name: string }[] = []
+  for (const y of ys) {
+    const b = bot.world.getBlock(wp.x, y, wp.z)
+    if (!b || !blocksWay(b.name)) continue
+    // 楼梯式上挖最上面那格只为起跳留头顶空间: 不可挖的 (箱子/基岩等) 不动它
+    if (y === wp.y + 2 && !isDiggable(b.name)) continue
+    out.push({ y, name: b.name })
+  }
+  return out
+}
+
+/** 把一条改地形的路径整理成给 LLM 确认的方案 */
+function describeRoute (bot: BotAgent, path: PathNode[], option: RouteProposal['option']): RouteProposal {
+  const dig: TerrainEdit[] = []
+  for (const n of path) if (n.dig) for (const c of digTargets(bot, n)) dig.push({ block: c.name, pos: [n.x, c.y, n.z] })
+  const place = path.filter(n => n.place).map(n => ({ pos: [n.x, n.y - 1, n.z] as Pos3, how: n.place! }))
+  // 按 placeScaffold 的用法 (按优先级一组组用完) 估算消耗
+  const uses: Record<string, number> = {}
+  let left = place.length
+  for (const s of scaffoldSlots(bot)) {
+    if (!left) break
+    const k = Math.min(left, s.item.count)
+    uses[s.item.name] = (uses[s.item.name] ?? 0) + k
+    left -= k
+  }
+  return {
+    option,
+    allow: { ...(option !== 'place' ? { allow_dig: true as const } : {}), ...(option !== 'dig' ? { allow_place: true as const } : {}) },
+    steps: path.length - 1, dig, place,
+    ...(place.length ? { uses } : {}),
+    ...(left ? { shortage: left } : {}),
+  }
+}
+
+/** 一次搜索的权限: 能否挖, 最多放几块 */
+interface Perm { dig: boolean, place: number }
+/** 算"搭方块"方案时假设的方块数 (背包不够也给出方案并注明缺多少) */
+const PROPOSAL_SCAFFOLD = 64
 
 /** 背包里所有工具 (挖掘选工具用) */
 export const toolCandidates = (bot: BotAgent) => bot.inventory.find(s => !!toolKind(s.name)).map(h => ({ slot: h.slot, name: h.item.name }))
@@ -32,9 +77,12 @@ export interface MoveOptions {
   /** 到达容差 (格); 0 = 必须站到目标格 */
   tolerance?: number
   timeoutMs?: number
+  /** 允许挖穿方块 (默认 false: 只走现成的路, 走不通时给出方案由调用方确认) */
   allowDig?: boolean
-  /** 允许垫方块/搭桥 (默认 true, 背包有泥土/圆石等时生效) */
+  /** 允许垫方块/搭桥 (默认 false; 开了也要背包有泥土/圆石等才生效) */
   allowPlace?: boolean
+  /** 走不通时计算挖/搭方案放进 extra.proposals (默认 true; 反射逃跑等用不上的关掉省算力) */
+  propose?: boolean
 }
 
 /** 单段规划的最远水平距离; 更远的目标分段前进 (每段重新规划, 区块会随移动加载) */
@@ -62,6 +110,7 @@ export class MoveToAction extends Action {
   private digStopSent = false
   private digEstMs = 0
   private digTries = 0
+  private digName = ''
   // 放置子状态
   private placeSentAt = 0
   private placeTries = 0
@@ -69,6 +118,10 @@ export class MoveToAction extends Action {
   // 开门
   private doorToggledAt = new Map<string, number>()
   private handOwner: string
+  /** 规划中: 第一次搜索同步做, 其余每 tick 一次 (多候选/多档权限/算方案时不长时间阻塞事件循环) */
+  private planner: Generator<void, void, void> | null = null
+  /** 实际改动的地形 */
+  readonly route = new RouteLog()
 
   constructor (private bot: BotAgent, private target: { x: number, y?: number, z: number }, private opts: MoveOptions = {}) {
     super('move_to')
@@ -97,22 +150,38 @@ export class MoveToAction extends Action {
     return y
   }
 
-  private plan (): boolean {
+  /** 开始 (重新) 规划; 结果异步落到 this.path, 或 fail */
+  private plan () {
+    this.path = null
+    this.planner = this.planSteps()
+    this.advancePlanner()
+  }
+
+  private advancePlanner () {
+    if (this.planner && this.planner.next().done) this.planner = null
+  }
+
+  /** 一次 A* 搜索; 带放置时方块不够或没搜到, 允许挖则不放方块再试一次 */
+  private search (from: PathNode, t: { to: PathNode, tol: number, maxExp?: number }, perm: Perm): PathNode[] | null {
+    const run = (place: number) => findPath(this.bot.world, from, t.to, { scaffold: place, allowDig: perm.dig, tolerance: t.tol, maxExpansions: t.maxExp })
+    let p = run(perm.place)
+    if (perm.place > 0 && (!p || placementsIn(p) > perm.place)) p = perm.dig ? run(0) : null
+    return p
+  }
+
+  /**
+   * 规划流程 (每个 yield = 让出到下一 tick):
+   * 1. 只走现成的路 (开门/爬梯/游泳, 不挖不放) 试所有候选目标
+   * 2. 调用方开了 allowDig/allowPlace 才带上改地形的权限再试
+   * 3. 都不行: 算出挖/搭方案 (不执行) 放进 extra.proposals, 失败返回给 LLM 决定
+   */
+  private * planSteps (): Generator<void, void, void> {
     const bot = this.bot, w = bot.world
     const from = { x: Math.floor(bot.pos.x), y: Math.floor(bot.pos.y), z: Math.floor(bot.pos.z) }
     const tx = Math.floor(this.target.x), tz = Math.floor(this.target.z)
     const dist = Math.hypot(tx - from.x, tz - from.z)
     const targetLoaded = !!w.getChunk(tx >> 4, tz >> 4)
-    const scaffold = this.opts.allowPlace === false ? 0 : scaffoldCount(bot)
-    const allowDig = this.opts.allowDig ?? true
-    const tryPath = (to: PathNode, tolerance: number, maxExpansions?: number) => {
-      let p = findPath(w, from, to, { scaffold, tolerance, allowDig, maxExpansions })
-      // 方块不够用, 或带放置的搜索没找到 (搜索空间大): 不放方块再试一次
-      if ((p && placementsIn(p) > scaffold) || (!p && scaffold > 0)) p = findPath(w, from, to, { scaffold: 0, tolerance, allowDig, maxExpansions })
-      return p
-    }
-    let path: PathNode[] | null = null
-    let to: PathNode
+    const targets: { to: PathNode, tol: number, maxExp?: number }[] = []
     this.segmenting = dist > SEGMENT || !targetLoaded
     if (this.segmenting) {
       // 朝目标方向取已加载的中途点: 先直线, 不通再偏一点角度/缩短距离; 优先落在陆地上 (海面中途点很难规划)
@@ -129,28 +198,63 @@ export class MoveToAction extends Action {
         }
       }
       cands.sort((a, b) => (a.land === b.land ? a.rank - b.rank : a.land ? -1 : 1))
-      if (!cands.length) { this.fail(`目标 (${tx},${tz}) 方向上没有已加载的区块`); return false }
-      to = cands[0].p
-      for (const c of cands.slice(0, 6)) {
-        path = tryPath(c.p, 3, 20000)
-        if (path) { to = c.p; break }
-      }
+      if (!cands.length) { this.fail(`目标 (${tx},${tz}) 方向上没有已加载的区块`); return }
+      for (const c of cands.slice(0, 6)) targets.push({ to: c.p, tol: 3, maxExp: 20000 })
     } else {
       const ty = Math.floor(this.target.y ?? bot.pos.y)
       // 精确目标 (tolerance 0 且给了 y) 不做高度自适应: 调用方选的点可能是要垫方块上去的空中位置
-      to = { x: tx, y: this.tol === 0 && this.target.y !== undefined ? ty : this.adaptY(tx, ty, tz), z: tz }
-      path = tryPath(to, this.tol)
+      targets.push({ to: { x: tx, y: this.tol === 0 && this.target.y !== undefined ? ty : this.adaptY(tx, ty, tz), z: tz }, tol: this.tol })
     }
-    if (!path || path.length === 0) {
-      this.fail(`无可行路径 ${from.x},${from.y},${from.z} -> ${to.x},${to.y},${to.z}${this.segmenting ? ' (远程中途点, 已试多个方向)' : ''}`)
-      return false
+
+    const have = scaffoldCount(bot)
+    const allowDig = !!this.opts.allowDig
+    const tiers: Perm[] = [{ dig: false, place: 0 }]
+    const granted: Perm | null = allowDig || (this.opts.allowPlace && have > 0) ? { dig: allowDig, place: this.opts.allowPlace ? have : 0 } : null
+    if (granted) tiers.push(granted)
+    let first = true
+    for (const tier of tiers) {
+      for (const t of targets) {
+        if (!first) yield
+        first = false
+        const p = this.search(from, t, tier)
+        if (p && p.length) { this.usePath(p); return }
+      }
     }
+
+    const t0 = targets[0].to
+    const allowed = [allowDig && '挖掘', this.opts.allowPlace && (have > 0 ? '搭方块' : '搭方块 (但背包没有垫脚方块)')].filter(Boolean).join('/')
+    const head = `无可行路径 ${from.x},${from.y},${from.z} -> ${t0.x},${t0.y},${t0.z}${this.segmenting ? ' (远程中途点, 已试多个方向)' : ''}${allowed ? ` (已允许${allowed})` : ' (只走现成的路, 不挖不搭)'}`
+    if (this.opts.propose === false) { this.fail(head); return }
+
+    // 算方案 (只针对首选目标): 已获准且试过的权限不再重复算
+    const H = Math.max(have, PROPOSAL_SCAFFOLD)
+    const covered = (m: Perm) => !!granted && (granted.dig || !m.dig) && granted.place >= m.place
+    const proposals: RouteProposal[] = []
+    const modes: [RouteProposal['option'], Perm][] = [['dig', { dig: true, place: 0 }], ['place', { dig: false, place: H }]]
+    for (const [option, m] of modes) {
+      if (covered(m)) continue
+      yield
+      const p = this.search(from, targets[0], m)
+      if (p && p.length) proposals.push(describeRoute(bot, p, option))
+    }
+    // 单独挖/单独搭都不行才算两者结合
+    if (!proposals.length && !covered({ dig: true, place: H })) {
+      yield
+      const p = this.search(from, targets[0], { dig: true, place: H })
+      if (p && p.length) proposals.push(describeRoute(bot, p, 'dig+place'))
+    }
+    this.extra = { ...this.extra, proposals }
+    this.fail(proposals.length
+      ? `${head}。可选方案 (确认后在原动作参数里加上对应开关重新下达; 也可以换目标或不动):\n${proposals.map(proposalText).join('\n')}`
+      : `${head}。挖/搭方案也找不到 (可能被岩浆/水/不可挖方块隔开, 或目标太远/悬空)`)
+  }
+
+  private usePath (path: PathNode[]) {
     this.path = path
     this.wpIdx = Math.min(1, path.length - 1)
     this.digY = null
     this.placeSentAt = 0
     this.pillarBaseY = null
-    return true
   }
 
   start () {
@@ -159,6 +263,7 @@ export class MoveToAction extends Action {
   }
 
   step (nowMs: number) {
+    if (this.planner) { this.halt(); this.advancePlanner(); return }
     if (!this.path) return
     const bot = this.bot
     if (nowMs > this.deadline) { this.stopMoving(); return this.fail('超时') }
@@ -191,7 +296,7 @@ export class MoveToAction extends Action {
     const arriveR = finalWp ? (this.tol === 0 && !this.segmenting ? 0.4 : 2.0) : (wp.climb ? 0.6 : 1.6)
     if (distWp < arriveR && vertOk && !(finalWp && this.tol === 0 && !bot.onGround && !inWater && !wp.climb)) {
       if (finalWp) {
-        if (this.segmenting) { this.segments++; this.lastProgressAt = nowMs; if (!this.plan()) this.stopMoving(); return }
+        if (this.segmenting) { this.segments++; this.lastProgressAt = nowMs; this.plan(); return }
         this.stopMoving()
         return this.finish(`到达 ${wp.x},${wp.y},${wp.z}${this.segments ? ` (分 ${this.segments + 1} 段)` : ''}`)
       }
@@ -249,8 +354,8 @@ export class MoveToAction extends Action {
     // ---- 重规划 ----
     if (nowMs - this.lastWpProgressAt > 5000) {
       if (++this.replans > 5) { this.stopMoving(); return this.fail(`重规划 5 次仍卡在 (${wp.x},${wp.y},${wp.z})`) }
-      if (!this.plan()) return
       this.lastWpProgressAt = nowMs
+      this.plan()
     }
   }
 
@@ -278,13 +383,13 @@ export class MoveToAction extends Action {
   private handleDig (wp: PathNode, nowMs: number): boolean {
     const bot = this.bot
     if (this.digY === null) {
-      const cells = wp.dig === 'up' ? [wp.y, wp.y + 1, wp.y + 2] : wp.dig === 'down' ? [wp.y] : [wp.y, wp.y + 1]
-      const next = cells.find(y => { const b = bot.world.getBlock(wp.x, y, wp.z); return b && !AIRISH.has(b.name) && !isSoft(b.name) && b.name !== 'water' })
-      if (next === undefined) { bot.releaseHand(this.handOwner); return false } // 已挖好, 正常走过去
-      this.digY = next; this.digSentAt = 0; this.digTries = 0
+      const next = digTargets(bot, wp)[0]
+      if (!next) { bot.releaseHand(this.handOwner); return false } // 已挖好, 正常走过去
+      this.digY = next.y; this.digName = next.name; this.digSentAt = 0; this.digTries = 0
     }
     const b = bot.world.getBlock(wp.x, this.digY, wp.z)
-    if (!b || AIRISH.has(b.name) || isSoft(b.name) || b.name === 'water') {
+    if (!b || !blocksWay(b.name)) {
+      if (b) this.route.add('dug', this.digName, wp.x, this.digY, wp.z)
       this.digY = null
       this.lastProgressAt = nowMs
       return true // 这格挖完了, 下个 tick 处理下一格
@@ -319,7 +424,10 @@ export class MoveToAction extends Action {
   private handleBridge (wp: PathNode, nowMs: number): boolean {
     const bot = this.bot
     const support = bot.world.getBlock(wp.x, wp.y - 1, wp.z)
-    if (support && !AIRISH.has(support.name) && support.name !== 'water' && !isSoft(support.name)) { this.placeSentAt = 0; this.placeTries = 0; return false }
+    if (support && !AIRISH.has(support.name) && support.name !== 'water' && !isSoft(support.name)) {
+      if (this.placeSentAt) this.route.add('placed', support.name, wp.x, wp.y - 1, wp.z) // 是自己放的 (不是原本就有)
+      this.placeSentAt = 0; this.placeTries = 0; return false
+    }
     this.halt()
     this.bot.physics.control.sneak = true // 边缘下蹲, 防止掉下去
     return this.placeScaffold(wp.x, wp.y - 1, wp.z, nowMs)
@@ -331,6 +439,7 @@ export class MoveToAction extends Action {
     const baseY = wp.y - 1
     const placed = bot.world.getBlock(wp.x, baseY, wp.z)
     const solid = placed && !AIRISH.has(placed.name) && !isSoft(placed.name)
+    if (solid && this.placeSentAt) { this.route.add('placed', placed.name, wp.x, baseY, wp.z); this.placeSentAt = 0; this.placeTries = 0 }
     c.forward = c.left = c.right = c.sprint = false
     if (solid && bot.onGround && bot.pos.y >= wp.y - 0.1) {
       // 已站上新方块
@@ -338,7 +447,7 @@ export class MoveToAction extends Action {
       this.placeTries = 0
       this.lastWpProgressAt = this.lastProgressAt = nowMs
       if (this.wpIdx < this.path!.length - 1) { this.wpIdx++; return }
-      if (this.segmenting) { this.segments++; if (!this.plan()) this.stopMoving(); return }
+      if (this.segmenting) { this.segments++; this.plan(); return }
       this.stopMoving()
       return this.finish(`到达 ${wp.x},${wp.y},${wp.z} (垫高上来)`)
     }
@@ -430,13 +539,15 @@ export class MoveToAction extends Action {
     this.bot.releaseHand(this.handOwner)
   }
 
+  // 结束时把实际改动的地形写进 detail 和 extra.route
   cancel (reason = '') {
-    super.cancel(reason)
+    if (this.status !== 'running') return
+    super.cancel(settleWithRoute(this, this.route, reason))
     this.stopMoving()
   }
 
-  finish (detail = '') { this.bot.releaseHand(this.handOwner); super.finish(detail) }
-  fail (detail = '') { this.stopMoving(); super.fail(detail) }
+  finish (detail = '') { if (this.status !== 'running') return; this.bot.releaseHand(this.handOwner); super.finish(settleWithRoute(this, this.route, detail)) }
+  fail (detail = '') { if (this.status !== 'running') return; this.stopMoving(); super.fail(settleWithRoute(this, this.route, detail)) }
 }
 
 function lerpAngle (a: number, b: number, t: number) {

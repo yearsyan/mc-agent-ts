@@ -263,7 +263,10 @@ const TOOLS: Tool[] = [
   }, ['command']),
   tool('look', '转向 (yaw: 0=南 90=西 180=北 -90=东; pitch: 90=正下 -90=正上)', { name: { type: 'string', description: '[admin]角色名' }, yaw: { type: 'number' }, pitch: { type: 'number' } }),
   tool('act', `执行动作 (异步, 返回 actionId, 用 wait_action 等结果; 新的主动作会取消正在进行的主动作):
-移动: move_to{x,z,y?,tolerance?} (自动开门/爬梯/游泳/垫方块/搭桥/挖穿, 远距离分段) | go_home | jump | stop
+移动: move_to{x,z,y?,tolerance?,allow_dig?,allow_place?} (自动开门/爬梯/游泳, 远距离分段) | go_home | jump | stop
+改地形确认: 寻路默认只走现成的路, 不挖不搭。走不通时动作失败, detail 和 proposals 给出挖/搭方案 (要挖掉哪些方块/在哪放几块/用什么方块)。
+  你来决定: 不动 / 换目标 / 在原动作参数里加 allow_dig:true (允许挖穿) 或 allow_place:true (允许垫高/搭桥, 需背包有泥土/圆石等) 重新下达。
+  开了权限也优先走现成的路。结束时 route 列出实际挖掉/放置的方块和坐标。collect/craft/smelt/use_block/sleep 走过去的路上同样适用
 采集: collect{block,count?,radius?} (找→走过去→用最佳工具挖→捡掉落物) | dig{x,y,z} | pickup_items{radius?}
 建造: place{x,y,z,item?|hotbar?,face?}
 合成: craft{item,count?} (任意配方; 3×3 自动找/放工作台) | smelt{item,count?,fuel?} (自动找/放熔炉)
@@ -275,6 +278,7 @@ const TOOLS: Tool[] = [
     name: { type: 'string', description: '[admin]角色名' },
     type: { type: 'string', enum: ['move_to', 'go_home', 'jump', 'stop', 'collect', 'dig', 'pickup_items', 'place', 'craft', 'smelt', 'equip', 'eat', 'use_item', 'select_slot', 'drop_item', 'use_block', 'sleep', 'wake', 'interact_entity', 'mount', 'dismount', 'trade', 'attack', 'shoot', 'open_container', 'chest_take', 'chest_put', 'close_window', 'respawn', 'craft_planks'] },
     x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' }, face: { type: 'number' }, tolerance: { type: 'number', description: 'move_to 到达容差, 0=精确' },
+    allow_dig: { type: 'boolean', description: '寻路允许挖穿方块 (默认 false; 先看失败返回的方案再决定开不开)' }, allow_place: { type: 'boolean', description: '寻路允许垫高/搭桥放方块 (默认 false)' },
     item: { type: 'string', description: '物品名, 如 oak_planks / wooden_pickaxe / bread' }, block: { type: 'string', description: '方块名, 如 oak_log / stone / iron_ore' },
     count: { type: 'number' }, radius: { type: 'number' }, fuel: { type: 'string' },
     entity_id: { type: 'number' }, hits: { type: 'number' }, shots: { type: 'number', description: 'shoot 最多射几箭, 默认 5' }, pickup: { type: 'boolean', description: 'shoot 后是否捡回箭, 默认 true' }, hotbar: { type: 'number' }, slot: { type: 'number' }, all: { type: 'boolean' },
@@ -293,11 +297,11 @@ ranged: auto(默认, 有弓有箭时远程怪/苦力怕/飞行怪用弓, 空闲�
   tool('wait_action', '等待动作完成。有人给你发消息 (私聊/聊天) 或你死亡时会立即中断等待并返回消息 (interrupted:true, 动作继续执行); interrupt:false 关闭中断', { name: { type: 'string', description: '[admin]角色名' }, actionId: { type: 'number' }, timeoutMs: { type: 'number' }, interrupt: { type: 'boolean', description: '默认 true' } }),
   tool('run_script', `运行 JS 脚本 (异步, 返回 scriptId; 是一个主动作, 会顶掉当前主动作)。适合重复/有循环的流程 (挖矿道、按规律采集、建造), 一次下发、跑完看结果再决定下一步。
 脚本体是 async 函数体: 可直接 await / return (返回值进 result)。抛错或子动作失败 = 脚本失败 (报行号)。
-动作 (await, 失败抛错, 可 try/catch): moveTo(pos,{tolerance}) dig(pos)→挖掉的方块名(空气返回 null) place(pos,item?,face?) collect(block,count,radius) pickup(r) equip(item) craft(item,n) smelt(item,n,fuel?) eat(item?) attack(id,hits) shoot(id,shots) useBlock(pos,item?) useItem(item?,holdMs) selectSlot(i) sleep(ms) | act(type,params) 通用 (同 act 工具) | tryAct(type,params)→{ok,status,detail} 不抛错
+动作 (await, 失败抛错, 可 try/catch): moveTo(pos,{tolerance,allowDig,allowPlace}) dig(pos)→挖掉的方块名(空气返回 null) place(pos,item?,face?) collect(block,count,radius) pickup(r) equip(item) craft(item,n) smelt(item,n,fuel?) eat(item?) attack(id,hits) shoot(id,shots) useBlock(pos,item?) useItem(item?,holdMs) selectSlot(i) sleep(ms) | act(type,params) 通用 (同 act 工具) | tryAct(type,params)→{ok,status,detail,extra} 不抛错 (move_to 走不通时 extra.proposals 是挖/搭方案; 抛出的错误同样带 e.extra)
 查询 (同步): pos() here()=脚下方块坐标 block(pos)→名字|null(未加载) isAir(pos) isSolid(pos) reach(pos)=眼睛到方块距离 (挖/放要 ≤4.5) scan(match,r≤24,limit)→[{name,pos,dist}] 近→远 (match: 名字/"*_ore"/数组/正则) findBlock(name,r) inv()→{物品:数量} count(item) freeSlots() held() hp() food() state() entities(r,type?)→[{id,type,pos,dist,hostile}] elapsed()
 坐标: vec(x,y,z) 或 {x,y,z}; Vec 方法 add/sub/offset/mul/up/down/north/south/east/west/right/left/floored/dist/equals; fwd()=当前朝向的水平单位向量 (东南西北之一), dir("north"|...)
 输出: log(...) (进日志) progress(obj) (最新进度快照) say(text); 参数 args 在脚本里是全局变量 args
-追踪: wait_action{actionId:scriptId} 结束时返回完整报告; script_status 看运行中进度。报告含 logs / progress / result / error{line,code} / stats{dug 挖掉的方块, items 物品增减, moved 位移, hp, food, actions 各子动作成败数}
+追踪: wait_action{actionId:scriptId} 结束时返回完整报告; script_status 看运行中进度。报告含 logs / progress / result / error{line,code} / stats{dug 挖掉的方块 (含寻路途中), placed 寻路放置的方块, items 物品增减, moved 位移, hp, food, actions 各子动作成败数}
 约束: 循环里必须 await 动作或 sleep (同步执行 >1.5s 会被判死循环); 默认 300s 超时 (timeoutSec 最大 1800); 反射层照常工作 (被怪打/逃跑接管时脚本会被打断, 看 error)。挖掘本身会拒绝挖开旁边有岩浆的方块
 示例: const f = fwd(); let p = here(); for (let i = 0; i < 20; i++) { p = p.add(f); await dig(p); await dig(p.up()); await moveTo(p); for (const o of scan('*_ore', 4)) log('矿', o.name, o.pos); if (hp() < 10) return {stop: '血少', i} } return {dug: i}`, {
     name: { type: 'string', description: '[admin]角色名' }, code: { type: 'string', description: '脚本源码 (async 函数体)' },
@@ -401,7 +405,7 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
     case 'act': {
       const { name: _n, ...body } = args
       const a = bot.act(String(args.type), body)
-      return txt(JSON.stringify({ actionId: a.id, type: a.type, status: a.status, detail: a.detail }))
+      return txt(JSON.stringify(actionResult(a)))
     }
     case 'run_script': {
       const a = bot.act('script', { code: String(args.code ?? ''), args: args.args, timeoutMs: args.timeoutSec != null ? Number(args.timeoutSec) * 1000 : undefined })
@@ -470,7 +474,7 @@ function findScript (bot: BotAgent, id?: any): ScriptAction | null {
 /** 动作结束时的返回: 脚本附完整报告 */
 function actionResult (a: Action) {
   if (a instanceof ScriptAction) return { actionId: a.id, type: a.type, detail: a.detail, ...a.report(0, 40) }
-  return { actionId: a.id, type: a.type, status: a.status, detail: a.detail }
+  return { actionId: a.id, type: a.type, status: a.status, detail: a.detail, ...a.extra }
 }
 
 // ---------- 收件箱 ----------
@@ -590,7 +594,7 @@ const server = http.createServer(async (req, res) => {
         if (action === 'look') { bot.look(Number(body.yaw ?? bot.yaw), Number(body.pitch ?? bot.pitch)); logCall(role, 'rest', 'look', logArgs, 0, txt('{"ok":true}')); return json(res, 200, { ok: true }) }
         if (action === 'act') {
           const a = bot.act(String(body.type), body)
-          const out = { actionId: a.id, type: a.type, status: a.status, detail: a.detail }
+          const out = actionResult(a)
           logCall(role, 'rest', 'act', logArgs, 0, txt(JSON.stringify(out)))
           return json(res, 200, out)
         }

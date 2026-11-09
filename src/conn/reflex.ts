@@ -166,7 +166,7 @@ export class Reflex {
             this.lastFleeAt = now
             this.state = 'fleeing'
             this.log(`逃离 ${from.e.type}#${from.e.id} (距离 ${from.d.toFixed(1)}, 血 ${bot.health.toFixed(0)}) → (${spot.x},${spot.z})`)
-            this.takeOver(new MoveToAction(bot, spot, { tolerance: 2, timeoutMs: 15_000 }), `逃离 ${from.e.type}`)
+            this.takeOver(new MoveToAction(bot, spot, { tolerance: 2, timeoutMs: 15_000, propose: false }), `逃离 ${from.e.type}`)
           }
         }
         return
@@ -232,7 +232,7 @@ export class Reflex {
         const go = new (class extends AsyncAction {
           constructor (b: BotAgent) { super(b, 'go_home'); this.byReflex = true }
           protected async run () {
-            if (far) { const mv = await this.sub(new MoveToAction(this.bot, h, { tolerance: 2 })); if (mv.status !== 'done') throw new Error(`回家失败: ${mv.detail}`) }
+            if (far) { const mv = await this.sub(new MoveToAction(this.bot, h, { tolerance: 2, propose: false })); if (mv.status !== 'done') throw new Error(`回家失败: ${mv.detail}`) }
             const s = await this.sub(new SleepAction(this.bot))
             return s.status === 'done' ? `到家并睡下: ${s.detail}` : `到家了, 没睡成: ${s.detail}`
           }

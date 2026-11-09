@@ -11,7 +11,7 @@ import { World } from '../world/world.js'
 import { PhysicsRunner } from '../physics/runner.js'
 import { Inventory } from './inventory.js'
 import { Action, MoveToAction, DigAction, PlaceAction, AttackAction, JumpAction, StopAction, SelectSlotAction, OpenContainerAction, ChestOpAction, DropItemAction, CloseWindowAction } from '../actions/actions.js'
-import { CraftAction, SmeltAction, CollectAction, PickupItemsAction, EquipAction, EatAction, UseItemAction, UseBlockAction, SleepAction, WakeAction, InteractEntityAction, DismountAction, TradeAction } from '../actions/tasks.js'
+import { Task, CraftAction, SmeltAction, CollectAction, PickupItemsAction, EquipAction, EatAction, UseItemAction, UseBlockAction, SleepAction, WakeAction, InteractEntityAction, DismountAction, TradeAction } from '../actions/tasks.js'
 import { Reflex } from './reflex.js'
 import { ShootAction } from '../actions/combat.js'
 import { itemName } from '../game/knowledge.js'
@@ -494,9 +494,12 @@ export class BotAgent {
     const int = (v: any, d?: number) => { const n = Math.floor(Number(v ?? d)); if (!Number.isFinite(n)) throw new Error(`参数缺失或不是数字 (动作 ${type})`); return n }
     const xyz = () => [int(params.x), int(params.y), int(params.z)] as const
     const str = (v: any, what: string) => { if (typeof v !== 'string' || !v) throw new Error(`${type} 需要参数 ${what}`); return v }
+    // 寻路改地形的权限: 默认只走现成的路, 走不通时动作失败并给出挖/搭方案, LLM 确认后带上开关重新下达
+    const flag = (v: any) => v === true || v === 'true' || v === 1
+    const moveOpts = { allowDig: flag(params.allow_dig), allowPlace: flag(params.allow_place) }
     let a: Action
     switch (type) {
-      case 'move_to': a = new MoveToAction(this, { x: +params.x, y: params.y != null ? +params.y : undefined, z: +params.z }, { tolerance: params.tolerance != null ? Math.max(0, int(params.tolerance)) : undefined }); break
+      case 'move_to': a = new MoveToAction(this, { x: +params.x, y: params.y != null ? +params.y : undefined, z: +params.z }, { tolerance: params.tolerance != null ? Math.max(0, int(params.tolerance)) : undefined, ...moveOpts }); break
       case 'dig': a = new DigAction(this, ...xyz()); break
       case 'place': a = new PlaceAction(this, ...xyz(), int(params.face, 1), { hotbar: params.hotbar != null ? int(params.hotbar) : undefined, item: params.item }); break
       case 'attack': a = new AttackAction(this, int(params.entity_id ?? params.entityId), int(params.hits, 3)); break
@@ -530,11 +533,12 @@ export class BotAgent {
       case 'go_home': {
         const h = this.reflex.policy.home
         if (!h) throw new Error('还没设置 home (set_policy {home: "here"} 或 {home: {x,y,z}})')
-        a = new MoveToAction(this, h, { tolerance: 1 }); break
+        a = new MoveToAction(this, h, { tolerance: 1, ...moveOpts }); break
       }
       case 'script': a = new ScriptAction(this, String(params.code ?? ''), { timeoutMs: params.timeoutMs, args: params.args }); break
       default: throw new Error(`未知动作类型: ${type}`)
     }
+    if (a instanceof Task) a.moveOpts = moveOpts
     return a
   }
 

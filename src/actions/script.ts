@@ -117,6 +117,7 @@ export class ScriptAction extends AsyncAction {
   private moved = 0
   private lastPos: { x: number, y: number, z: number } | null = null
   private dug: Record<string, number> = {}
+  private placed: Record<string, number> = {}
   private subStats: Record<string, { ok: number, failed: number }> = {}
   private current: string | null = null
 
@@ -166,6 +167,7 @@ export class ScriptAction extends AsyncAction {
       log_seq: this.logSeq,
       stats: {
         dug: this.dug,
+        placed: this.placed,
         items,
         moved: +this.moved.toFixed(1),
         hp: `${this.hp0}→${Math.round(this.bot.health)}`,
@@ -225,7 +227,7 @@ export class ScriptAction extends AsyncAction {
   }
 
   /** 跑一个子动作; 失败时 throwOnFail 则抛错 */
-  private async runSub (type: string, params: any, throwOnFail = true): Promise<{ ok: boolean, status: string, detail: string }> {
+  private async runSub (type: string, params: any, throwOnFail = true): Promise<{ ok: boolean, status: string, detail: string, extra?: Record<string, unknown> }> {
     this.enter()
     if (BANNED.has(type)) throw new Error(`脚本里不能用 ${type} (要停下就 return 或 throw)`)
     // 调用时的同步栈里有脚本帧: 记下行号 (await 之后再抛错就找不到了)
@@ -241,10 +243,14 @@ export class ScriptAction extends AsyncAction {
     }
     const st = this.subStats[type] ??= { ok: 0, failed: 0 }
     if (a.status === 'done' && digName) this.dug[digName] = (this.dug[digName] ?? 0) + 1
+    // 寻路途中改动的地形 (move_to / collect 等带 allow_dig / allow_place 时)
+    const route = a.extra?.route as { dug: { block: string }[], placed: { block: string }[] } | undefined
+    for (const e of route?.dug ?? []) this.dug[e.block] = (this.dug[e.block] ?? 0) + 1
+    for (const e of route?.placed ?? []) this.placed[e.block] = (this.placed[e.block] ?? 0) + 1
     if (a.status === 'done') st.ok++
     else st.failed++
-    if (a.status !== 'done' && throwOnFail) throw Object.assign(new Error(`${type} 失败: ${a.detail}`), { scriptLine: line })
-    return { ok: a.status === 'done', status: a.status, detail: a.detail }
+    if (a.status !== 'done' && throwOnFail) throw Object.assign(new Error(`${type} 失败: ${a.detail}`), { scriptLine: line, ...(a.extra ? { extra: a.extra } : {}) })
+    return { ok: a.status === 'done', status: a.status, detail: a.detail, ...(a.extra ? { extra: a.extra } : {}) }
   }
 
   /** 注入脚本的全局 API */
@@ -347,7 +353,7 @@ export class ScriptAction extends AsyncAction {
         const isNum = typeof a === 'number'
         const v = isNum ? toVec(a, b, c) : toVec(a)
         const o = (isNum ? d : b) ?? {}
-        return run('move_to', { x: v.x, y: v.y, z: v.z, ...(o.tolerance != null ? { tolerance: o.tolerance } : {}) })
+        return run('move_to', { x: v.x, y: v.y, z: v.z, ...(o.tolerance != null ? { tolerance: o.tolerance } : {}), ...(o.allowDig ? { allow_dig: true } : {}), ...(o.allowPlace ? { allow_place: true } : {}) })
       },
       dig: async (a: any, y?: number, z?: number) => {
         const v = blockVec(a, y, z)

@@ -26,7 +26,7 @@
 
 | 类别 | 动作 |
 |---|---|
-| 移动 | `move_to{x,z,y?,tolerance?}`（自动开门/爬梯/游泳/垫高/搭桥/挖穿, 远距离分段；连续深水 ≥6 格自动冲刺游泳）· `go_home` · `jump` · `stop` |
+| 移动 | `move_to{x,z,y?,tolerance?,allow_dig?,allow_place?}`（自动开门/爬梯/游泳, 远距离分段；连续深水 ≥6 格自动冲刺游泳；挖穿/垫高/搭桥需确认，见下）· `go_home` · `jump` · `stop` |
 | 采集 | `collect{block,count?,radius?}`（找→走→最佳工具挖→捡）· `dig{x,y,z}`（自动换工具）· `pickup_items` |
 | 建造/合成 | `place{x,y,z,item?}` · `craft{item,count?}`（3×3 自动找放工作台）· `smelt{item,count?,fuel?}`（自动找放熔炉/选燃料） |
 | 物品 | `equip{item}`（工具/盔甲/盾）· `eat` · `use_item` · `select_slot` · `drop_item` |
@@ -35,13 +35,22 @@
 | 容器 | `open_container` · `chest_take{slot}` · `chest_put{slot}` · `close_window` |
 | 死亡 | `respawn`（仅 autoRespawn=false 时需要） |
 
+**改地形需确认**：寻路默认只走现成的路（开门/爬梯/游泳），不挖不搭。
+- 走不通时动作失败，`detail` 写明原因，`proposals` 给出方案：只挖 / 只搭，两者都不行才给挖+搭。每个方案列出要挖掉的方块和坐标、要放方块的位置（搭桥/垫高）、会用掉哪些方块、背包还差几个（方案按最多 64 块估算）。
+- LLM 选择不动、换目标，或者在原动作参数里加 `allow_dig:true` / `allow_place:true` 重新下达。
+- 开了权限也会先试只走现成的路，不通才改地形。
+- 结束时（完成、失败、取消都算）`detail` 末尾和 `route{dug,placed}` 列出实际挖掉/放置的方块及坐标。
+- `collect`/`craft`/`smelt`/`use_block`/`sleep` 走去目标的路上规则相同：未获准时不会垫高够树顶、不会挖进去取埋着的矿，只返回改动最少的方案。
+- 反射层：逃跑、夜间回家都不改地形。
+- 规划时第一次搜索同步完成，之后的候选点、权限档位和方案计算每个 tick 只搜一次，不会长时间阻塞事件循环。
+
 **死亡感知**：`death_combat_event` 为主源（关死亡消息时按伤害类型+攻击者推断，重登还原死亡点）；`get_scene.last_death` 给死因/凶手/死亡物品/掉落物剩余存活秒数；聊天推送 `[你死了]/[掉落]/[已复活]`。
 
 ### 脚本（`run_script`）
 
 把有循环/重复的流程（挖矿道、按规律采集、建造）写成一段 JS 一次下发，跑完看报告再决定下一步。脚本是一个主动作（互斥/死亡/反射接管照常取消它），里面每个子动作都走现有 act 实现。
-- API：动作 `await dig/moveTo/place/collect/equip/craft/…`、通用 `act`/`tryAct`；同步查询 `here/block/scan("*_ore",r)/reach/inv/hp/entities/fwd…`；`Vec` 坐标运算；`log`/`progress` 输出；参数经 `args` 传入
-- 报告（`wait_action` 结束时、`script_status` 运行中）：status/result/error{line,code}/logs/progress + 自动统计 `stats{dug, items 物品增减, moved, hp, food, actions 子动作成败}`
+- API：动作 `await dig/moveTo/place/collect/equip/craft/…`（`moveTo(p,{allowDig,allowPlace})`；走不通时抛出的错误带 `e.extra.proposals`）、通用 `act`/`tryAct`；同步查询 `here/block/scan("*_ore",r)/reach/inv/hp/entities/fwd…`；`Vec` 坐标运算；`log`/`progress` 输出；参数经 `args` 传入
+- 报告（`wait_action` 结束时、`script_status` 运行中）：status/result/error{line,code}/logs/progress + 自动统计 `stats{dug（含寻路途中挖的）, placed（寻路放置的）, items 物品增减, moved, hp, food, actions 子动作成败}`
 - 跑在 `node:vm`（只防误伤：禁 eval/new Function；循环体插守卫，同步执行 >1.5s 判死循环）；默认 300s 超时（≤1800s）
 
 ```js

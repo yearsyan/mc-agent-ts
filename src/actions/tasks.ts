@@ -4,7 +4,8 @@
  */
 import type { BotAgent } from '../conn/bot.js'
 import { AsyncAction } from './base.js'
-import { MoveToAction, DigAction, PlaceAction, scaffoldSlots } from './actions.js'
+import { MoveToAction, DigAction, PlaceAction, scaffoldSlots, type MoveOptions } from './actions.js'
+import { RouteLog, settleWithRoute, proposalCost, type RouteProposal } from './route.js'
 import { standableCell } from './astar.js'
 import { holdSlot, holdItem, holdNothing, closeContainer, faceTowards, reachTo } from './hands.js'
 import { mcData, itemName, itemId, foodScore, fuelTicks, blockProps } from '../game/knowledge.js'
@@ -33,8 +34,7 @@ export const approachSpot = (bot: BotAgent, x: number, y: number, z: number) => 
  * 够不着时的备选: 在目标旁边的一列垫方块上去 (如高处的树干)。
  * 返回站立格 (由 MoveTo 规划 pillar 上升), 需要背包里有足够的垫脚方块。
  */
-export function pillarSpot (bot: BotAgent, x: number, y: number, z: number): { x: number, y: number, z: number } | null {
-  const have = scaffoldSlots(bot).reduce((n, h) => n + h.item.count, 0)
+export function pillarSpot (bot: BotAgent, x: number, y: number, z: number, have = scaffoldSlots(bot).reduce((n, h) => n + h.item.count, 0)): { x: number, y: number, z: number } | null {
   let best: { x: number, y: number, z: number } | null = null, bestD = Infinity
   // 旁边 4 列: 站到与目标同高附近; 目标自身这列 (如已挖空的树干): 站到目标下方 2 格仰头挖
   for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [0, 0]]) {
@@ -68,29 +68,82 @@ function exposed (bot: BotAgent, x: number, y: number, z: number) {
   return [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].some(([dx, dy, dz]) => !bot.world.isSolid(x + dx, y + dy, z + dz))
 }
 
-/** 走到能够着 (x,y,z) 的位置; 已够着则不动; 太高时在旁边垫方块上去; 埋着的挖进去 */
-async function reachBlock (act: AsyncAction & { subMove: (t: any, o?: any) => Promise<MoveToAction> }, bot: BotAgent, x: number, y: number, z: number, what: string) {
+/**
+ * 走到能够着 (x,y,z) 的位置; 已够着则不动。
+ * 先只走现成的路试各接近点; 任务获准改地形 (allow_dig/allow_place) 才垫高上去 / 挖进去 (埋着的矿);
+ * 未获准又走不到时, 算出改动最少的挖/搭方案放进任务的 extra.proposals 并失败, 由 LLM 决定。
+ */
+async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: number, what: string) {
   if (reachTo(bot, x, y, z) <= 4.3) return
-  // 依次试最近的几个接近点 (有的看似能站却到不了, 如树冠上), 都不行再垫方块上去, 最后挖进去 (埋在地下的矿)
-  const spots = approachSpots(bot, x, y, z).slice(0, 3)
-  const pillar = pillarSpot(bot, x, y, z)
-  if (pillar) spots.push(pillar)
-  spots.push(...digInSpots(bot, x, y, z))
-  if (!spots.length) throw new Error(`${what} (${x},${y},${z}) 够不着: 周围没有能站的位置${scaffoldSlots(bot).length ? '' : ' (背包有泥土/圆石时可垫高)'}`)
+  const { allowDig, allowPlace } = act.moveOpts
+  const approach = approachSpots(bot, x, y, z).slice(0, 3)
   let err = ''
-  for (const spot of spots) {
-    const mv = await act.subMove(spot, { tolerance: 0 })
-    if (mv.status === 'done' && reachTo(bot, x, y, z) <= 4.6) return
-    err = mv.status === 'done' ? '到了但还是够不着' : mv.detail
+  const tryAll = async (spots: { x: number, y: number, z: number }[], opts: MoveOptions) => {
+    for (const spot of spots) {
+      const mv = await act.subMove(spot, { tolerance: 0, ...opts })
+      if (mv.status === 'done' && reachTo(bot, x, y, z) <= 4.6) return true
+      err = mv.status === 'done' ? '到了但还是够不着' : mv.detail
+    }
+    return false
   }
-  throw new Error(`走到${what}失败: ${err}`)
+  // 第一轮: 只走现成的路 (有的接近点看似能站却到不了, 如树冠上)
+  if (await tryAll(approach, { allowDig: false, allowPlace: false })) return
+  const pillar = pillarSpot(bot, x, y, z)
+  const digIn = digInSpots(bot, x, y, z)
+  // 第二轮: 已获准改地形, 带权限再试 (接近点 → 垫高点 → 挖进去)
+  if (allowDig || allowPlace) {
+    const spots = [...approach, ...(allowPlace && pillar ? [pillar] : []), ...(allowDig ? digIn : [])]
+    if (!spots.length) throw new Error(`${what} (${x},${y},${z}) 够不着: 周围没有能站/能垫高/能挖进去的位置${allowPlace && !scaffoldSlots(bot).length ? ' (背包没有泥土/圆石, 垫不了)' : ''}`)
+    if (await tryAll(spots, {})) return
+    throw new Error(`走到${what}失败: ${err}`)
+  }
+  // 未获准: 对垫高点/挖进点/最近接近点算方案, 取改动最少的
+  const cands = [pillar ?? pillarSpot(bot, x, y, z, 64), digIn[0], approach[0]]
+    .filter((c): c is { x: number, y: number, z: number } => !!c).slice(0, 2)
+  let best: { mv: MoveToAction, props: RouteProposal[] } | null = null
+  const cost = (ps: RouteProposal[]) => Math.min(...ps.map(proposalCost))
+  for (const spot of cands) {
+    const mv = await act.subMove(spot, { tolerance: 0, allowDig: false, allowPlace: false, propose: true })
+    if (mv.status === 'done' && reachTo(bot, x, y, z) <= 4.6) return
+    const props = (mv.extra?.proposals as RouteProposal[] | undefined) ?? []
+    if (props.length && (!best || cost(props) < cost(best.props))) best = { mv, props }
+    else if (!best) err = mv.status === 'done' ? '到了但还是够不着' : mv.detail
+  }
+  if (best) {
+    act.extra = { ...act.extra, proposals: best.props }
+    throw new Error(`${what} (${x},${y},${z}) 只走现成的路够不着, 要改地形: ${best.mv.detail}`)
+  }
+  throw new Error(`走到${what}失败: ${err || '周围没有能站的位置'}`)
 }
 
 /** 带 subMove 的任务基类 */
 export abstract class Task extends AsyncAction {
-  async subMove (t: { x: number, y?: number, z: number }, opts: { tolerance?: number, timeoutMs?: number } = {}) {
-    return this.sub(new MoveToAction(this.bot, t, opts))
+  /** 寻路能否改地形 (act 参数 allow_dig / allow_place 传入; 默认都不允许) */
+  moveOpts: { allowDig?: boolean, allowPlace?: boolean } = {}
+  /** 各段寻路实际改动的地形 (汇总) */
+  readonly route = new RouteLog()
+  private curMove: MoveToAction | null = null
+
+  /** 走到 t; 默认继承任务的改地形权限, 不算方案 (要方案的调用方传 propose:true) */
+  async subMove (t: { x: number, y?: number, z: number }, opts: MoveOptions = {}) {
+    const mv = new MoveToAction(this.bot, t, { ...this.moveOpts, propose: false, ...opts })
+    this.curMove = mv
+    try {
+      return await this.sub(mv)
+    } finally {
+      this.route.merge(mv.route)
+      this.curMove = null
+    }
   }
+
+  // 结束时把寻路改动的地形写进 detail 和 extra.route (取消时子寻路可能还没汇总, 先并进来)
+  private settle (detail: string) {
+    if (this.curMove) this.route.merge(this.curMove.route)
+    return settleWithRoute(this, this.route, detail)
+  }
+  finish (detail = '') { if (this.status === 'running') super.finish(this.settle(detail)) }
+  fail (detail = '') { if (this.status === 'running') super.fail(this.settle(detail)) }
+  cancel (reason = '') { if (this.status === 'running') super.cancel(this.settle(reason)) }
 
   /** 找到/走到/放置一个工作方块 (工作台/熔炉), 返回其坐标 */
   protected async ensureStation (block: string, label: string): Promise<{ x: number, y: number, z: number }> {
