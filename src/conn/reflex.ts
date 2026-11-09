@@ -4,6 +4,7 @@
  * 优先级: 危险地形逃生 > 战斗/逃跑 > 进食 > 夜间回家睡觉。
  */
 import type { BotAgent } from './bot.js'
+import { isHotbar, hotbarIndex } from './inventory.js'
 import type { Action } from '../actions/base.js'
 import { AsyncAction } from '../actions/base.js'
 import { MoveToAction } from '../actions/actions.js'
@@ -269,8 +270,8 @@ export class Reflex {
     if (this.state !== 'fighting') this.log(`迎战 ${e.type}#${e.id} (血 ${bot.health.toFixed(0)})`)
     this.state = 'fighting'
     // 手里换上最好的武器 (仅在快捷栏里的, 不做背包交换以免拖慢)
-    const w = bot.inventory.find(s => weaponScore(s.name) > 0).filter(h => h.slot >= 36).sort((a, b) => weaponScore(b.item.name) - weaponScore(a.item.name))[0]
-    if (w && bot.handFree() && bot.inventory.heldSlot !== w.slot - 36) { bot.selectSlot(w.slot - 36); return }
+    const w = bot.inventory.find(s => weaponScore(s.name) > 0).filter(h => isHotbar(h.slot)).sort((a, b) => weaponScore(b.item.name) - weaponScore(a.item.name))[0]
+    if (w && bot.handFree() && bot.inventory.heldSlot !== hotbarIndex(w.slot)) { bot.selectSlot(hotbarIndex(w.slot)); return }
     if (this.shieldUp) { this.lowerShield(); this.pendingStrike = entityId; this.lastAttackAt = now; return } // 举盾时不能攻击: 先放下, 下 tick 砍
     this.strike(entityId, now)
   }
@@ -282,8 +283,7 @@ export class Reflex {
     const dx = e.x - bot.pos.x, dz = e.z - bot.pos.z
     bot.yaw = Math.atan2(-dx, dz) * 180 / Math.PI
     bot.pitch = 10
-    bot.client.write('attack', { entityId })
-    bot.client.write('arm_animation', { hand: 'main_hand' })
+    bot.attackEntity(entityId)
     this.lastAttackAt = now
   }
 
@@ -302,7 +302,7 @@ export class Reflex {
 
   shieldReady () {
     const bot = this.bot
-    return this.policy.shield && bot.inventory.slots[45]?.name === 'shield' && !bot.onCooldown('shield')
+    return this.policy.shield && bot.inventory.offhand()?.name === 'shield' && !bot.onCooldown('shield')
   }
 
   private creeperLit (e: { meta: Record<string, any> }) { return (e.meta.swell_dir ?? -1) > 0 || !!e.meta.is_ignited }
@@ -324,7 +324,7 @@ export class Reflex {
     }
     if (this.pendingStrike !== null) { const id = this.pendingStrike; this.pendingStrike = null; this.strike(id, now); return true }
     // 自动把盾放到副手 (副手空着才放, 不顶掉图腾)
-    if (this.policy.shield && !bot.inventory.slots[45] && now - this.lastEquipShieldAt > 15_000 && bot.inventory.find(s => s.name === 'shield').length && bot.inventory.activeWindowId === null) {
+    if (this.policy.shield && !bot.inventory.offhand() && now - this.lastEquipShieldAt > 15_000 && bot.inventory.find(s => s.name === 'shield').length && bot.inventory.activeWindowId === null) {
       this.lastEquipShieldAt = now
       const a = new EquipAction(bot, 'shield'); a.byReflex = true
       a.onSettle = (x) => { if (x.status === 'done') this.log('盾牌放到副手') }

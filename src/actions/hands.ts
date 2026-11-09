@@ -1,9 +1,10 @@
 /**
  * 手持/背包操作辅助: 把物品换到快捷栏并选中、放置方块、关窗口。
- * 槽位一律用玩家窗口 (窗口 0) 编号: 9-35 背包, 36-44 快捷栏, 45 副手。
+ * 槽位一律用玩家窗口 (窗口 0) 编号, 布局见 conn/inventory.ts 的 SLOT。
  */
 import type { BotAgent } from '../conn/bot.js'
 import type { AsyncAction } from './base.js'
+import { HOTBAR_SIZE, hotbarSlot, hotbarIndex, isHotbar } from '../conn/inventory.js'
 import { toolKind, foodScore, weaponScore } from '../game/knowledge.js'
 
 /** 有容器窗口开着时, 窗口 0 的点击会被服务器忽略; 先关掉 */
@@ -21,20 +22,20 @@ function pickHotbarTarget (bot: BotAgent): number {
     const n = hb[i]!.name
     return (toolKind(n) ? 3 : 0) + (weaponScore(n) ? 3 : 0) + (foodScore(n) ? 2 : 0)
   }
-  let best = 8
-  for (let i = 8; i >= 0; i--) if (value(i) < value(best)) best = i
+  let best = HOTBAR_SIZE - 1
+  for (let i = HOTBAR_SIZE - 1; i >= 0; i--) if (value(i) < value(best)) best = i
   return best
 }
 
 /** 把 slot 的物品放到快捷栏, 返回快捷栏下标 (已在快捷栏则直接返回) */
 export async function toHotbar (act: AsyncAction, bot: BotAgent, slot: number): Promise<number> {
-  if (slot >= 36 && slot <= 44) return slot - 36
+  if (isHotbar(slot)) return hotbarIndex(slot)
   const name = bot.inventory.slots[slot]?.name
   if (!name) throw new Error(`槽位 ${slot} 是空的`)
   closeContainer(bot)
   const target = pickHotbarTarget(bot)
   bot.clickSlot(0, slot, target, 2) // mode 2 = 与快捷栏 button 位交换
-  await act.until(() => bot.inventory.slots[36 + target]?.name === name, 2000, '物品换到快捷栏')
+  await act.until(() => bot.inventory.slots[hotbarSlot(target)]?.name === name, 2000, '物品换到快捷栏')
   return target
 }
 
@@ -59,7 +60,7 @@ export async function holdNothing (act: AsyncAction, bot: BotAgent) {
   const hb = bot.inventory.hotbar()
   let idx = hb.findIndex(s => !s)
   if (idx < 0) idx = hb.findIndex(s => !!s && (!!toolKind(s.name) || !!foodScore(s.name)))
-  if (idx < 0) idx = 8
+  if (idx < 0) idx = HOTBAR_SIZE - 1
   if (bot.inventory.heldSlot !== idx) { bot.selectSlot(idx); await act.sleep(60) }
 }
 
@@ -68,8 +69,8 @@ export async function holdNothing (act: AsyncAction, bot: BotAgent) {
  * 否则发一次交换点击并返回 false, 调用方下个 tick 再试。
  */
 export function prepareHeld (bot: BotAgent, slot: number): boolean {
-  if (slot >= 36 && slot <= 44) {
-    if (bot.inventory.heldSlot !== slot - 36) bot.selectSlot(slot - 36)
+  if (isHotbar(slot)) {
+    if (bot.inventory.heldSlot !== hotbarIndex(slot)) bot.selectSlot(hotbarIndex(slot))
     return true
   }
   const now = Date.now()
@@ -83,16 +84,8 @@ const lastSwapAt = new Map<string, number>()
 
 /** 在 (x,y,z) 放置手里的方块 (空气/可替换格可直接放, 不需要相邻支撑) */
 export function placeBlockAt (bot: BotAgent, x: number, y: number, z: number, face = 1) {
-  bot.client.write('block_place', {
-    hand: 'main_hand',
-    location: { x, y, z },
-    direction: face,
-    cursorX: 0.5, cursorY: 0.5, cursorZ: 0.5,
-    insideBlock: false,
-    worldBorderHit: false,
-    sequence: bot.nextSequence(),
-  })
-  bot.client.write('arm_animation', { hand: 'main_hand' })
+  bot.useOnBlock(x, y, z, face)
+  bot.swing()
 }
 
 /** 面向某点 (更新 yaw/pitch, 随下一 tick 的 position_look 发给服务器) */

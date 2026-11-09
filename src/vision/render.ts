@@ -5,15 +5,12 @@
  * - 深度缓冲: 实体按真实尺寸投影, 被方块挡住的部分不画; 标注 #编号 (= act 的 entity_id)
  * - HUD: 准星 + 顶部罗盘
  */
-import { createRequire } from 'node:module'
 import { PNG } from 'pngjs'
 import { blockName, type World } from '../world/world.js'
 import { blockColor, SKY, VOID_COLOR, type RGB } from './colors.js'
 import { drawText, textWidth, textHeight, blend, fillRect, LabelLayout, type RGBA } from './font.js'
 
-const require2 = createRequire(import.meta.url)
-const mcData: any = require2('minecraft-data')('26.3')
-const Block: any = require2('prismarine-block')(mcData)
+import { mcData, Block } from '../version.js'
 
 const MAX_DIST = 80
 

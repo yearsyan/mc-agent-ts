@@ -6,11 +6,11 @@
  *  - 26.3 teleport_confirm 坐标回显; 每 tick 恰好一对 position+tick_end
  */
 import mc from 'minecraft-protocol'
-import { createRequire } from 'node:module'
-import { World } from '../world/world.js'
+import { MC_VERSION, mcData } from '../version.js'
+import { World, metaKeyName } from '../world/world.js'
 import { parseDimType, vanillaDim, type DimType } from '../world/dimension.js'
 import { PhysicsRunner } from '../physics/runner.js'
-import { Inventory } from './inventory.js'
+import { Inventory, SLOT } from './inventory.js'
 import { approvalOf, type RouteProposal, type Approval } from '../actions/route.js'
 import { MAX_MOVE_DIST, Action, MoveToAction, DigAction, PlaceAction, JumpAction, StopAction, SelectSlotAction, OpenContainerAction, ChestOpAction, DropItemAction, CloseWindowAction } from '../actions/actions.js'
 import { Task, ReachThen, ChestTransferAction, containerBlocked, CraftAction, SmeltAction, CollectAction, PickupItemsAction, EquipAction, EatAction, UseItemAction, UseBlockAction, SleepAction, WakeAction, InteractEntityAction, DismountAction, TradeAction } from '../actions/tasks.js'
@@ -61,6 +61,12 @@ export type BotEvent =
 const SIDE_ACTIONS = new Set(['select_slot', 'chest_take', 'chest_put', 'drop_item', 'close_window', 'equip', 'wake', 'dismount'])
 
 const FABRIC_CHANNELS = ['fabric:registry/sync', 'fabric:registry/sync/complete']
+
+/**
+ * block_dig 包的 status 取值 (协议相关, 换版本要核对)。
+ * 26.3: 0 = START_DESTROY, 3 = STOP_DESTROY (挖完), 6 = RELEASE_USE_ITEM
+ */
+const DIG_STATUS = { start: 0, finish: 3, releaseUse: 6 } as const
 const TICK_MS = 50
 
 export class BotAgent {
@@ -168,7 +174,7 @@ export class BotAgent {
         host: this.opts.host,
         port: this.opts.port,
         username: this.opts.username,
-        version: '26.3',
+        version: MC_VERSION,
         auth: 'offline',
       })
       this.client = client
@@ -254,10 +260,11 @@ export class BotAgent {
       client.on('entity_metadata', (p: any) => {
         for (const m of p.metadata ?? []) {
           if (p.entityId === this.entityId) {
-            if (m.key === 0) this.onFire = (Number(m.value) & 1) !== 0
-            else if (m.key === 1) this.air = Number(m.value)
-            else if (m.key === 6) this.sleeping = m.value === 'sleeping' || m.value === 2
-          } else if (m.key === 8 && m.value && typeof m.value === 'object' && m.value.itemId !== undefined) {
+            const k = metaKeyName('player', m.key)
+            if (k === 'shared_flags') this.onFire = (Number(m.value) & 1) !== 0
+            else if (k === 'air_supply') this.air = Number(m.value)
+            else if (k === 'pose') this.sleeping = m.value === 'sleeping' || m.value === 2
+          } else if (this.world.metaKeyName(p.entityId, m.key) === 'item' && m.value && typeof m.value === 'object' && m.value.itemId !== undefined) {
             this.world.setEntityItem(p.entityId, itemName(m.value.itemId), m.value.itemCount ?? 1) // 掉落物实体的物品
           } else if (typeof m.value !== 'object' || m.value === null) {
             this.world.setEntityMeta(p.entityId, m.key, m.value) // 拉弓 (living_entity_flags) / 苦力怕膨胀 (swell_dir) / 箭插地 (in_ground) 等
@@ -577,7 +584,7 @@ export class BotAgent {
         else throw new Error(`${type} 需要 item (物品名), 或旧用法 slot`)
         break
       }
-      case 'drop_item': a = new DropItemAction(this, int(params.slot, 36), !!params.all); break
+      case 'drop_item': a = new DropItemAction(this, int(params.slot, SLOT.hotbar), !!params.all); break
       case 'close_window': a = new CloseWindowAction(this); break
       case 'craft': a = new CraftAction(this, str(params.item, 'item'), int(params.count, 1)); break
       case 'craft_planks': { // 兼容旧动作: 用背包里第一种原木合成木板
@@ -812,10 +819,46 @@ export class BotAgent {
     this.client.write('use_item', { hand, sequence: this.nextSequence(), rotation: { x: this.yaw, y: this.pitch } })
   }
 
-  /** 松开使用中的物品 (松弓射箭 / 放下盾) = block_dig status 6 */
+  /** 松开使用中的物品 (松弓射箭 / 放下盾) */
   releaseUseItem () {
-    this.client.write('block_dig', { status: 6, location: { x: 0, y: 0, z: 0 }, face: 0, sequence: 0 })
+    this.client.write('block_dig', { status: DIG_STATUS.releaseUse, location: { x: 0, y: 0, z: 0 }, face: 0, sequence: 0 })
     this.usingHand = null
+  }
+
+  /** 开始挖方块 (face: 0 下 1 上 2 北 3 南 4 西 5 东) */
+  digStart (x: number, y: number, z: number, face: number) {
+    this.client.write('block_dig', { status: DIG_STATUS.start, location: { x, y, z }, face, sequence: this.nextSequence() })
+  }
+
+  /** 挖够时间后告诉服务器"挖完了" (不要重发 start, 会重置服务器端进度) */
+  digFinish (x: number, y: number, z: number, face: number) {
+    this.client.write('block_dig', { status: DIG_STATUS.finish, location: { x, y, z }, face, sequence: this.nextSequence() })
+  }
+
+  /** 挥主手 (动画; 挖掘/攻击时原版客户端也会发) */
+  swing () {
+    this.client.write('arm_animation', { hand: 'main_hand' })
+  }
+
+  /** 近战攻击实体 (含挥手) */
+  attackEntity (entityId: number) {
+    this.client.write('attack', { entityId })
+    this.swing()
+  }
+
+  /** 潜行键 (骑乘时按下 = 下坐骑) */
+  setSneakInput (down: boolean) {
+    this.client.write('player_input', { inputs: down ? { shift: true } : {} })
+  }
+
+  /** 下床 */
+  stopSleeping () {
+    this.client.write('entity_action', { entityId: this.entityId, actionId: 'stop_sleeping', jumpBoost: 0 })
+  }
+
+  /** 交易窗口选第 index 项 (服务器自动把付款物品从背包填进付款格) */
+  selectTrade (index: number) {
+    this.client.write('select_trade', { slot: index })
   }
 
   /** 物品组是否在冷却 (如 shield) */
@@ -824,7 +867,7 @@ export class BotAgent {
   /** 右键实体 (交易/喂食/骑乘/剪毛…) */
   interactEntity (entityId: number) {
     this.client.write('use_entity', { target: entityId, hand: 'main_hand', location: { x: 0, y: 0.9, z: 0 }, sneaking: false })
-    this.client.write('arm_animation', { hand: 'main_hand' })
+    this.swing()
   }
 
   /** 左键点击窗口槽位 (拿起/放下整组) */
@@ -836,11 +879,14 @@ export class BotAgent {
   }
 
   /** 右键交互方块 (开箱等; 手上需为空或非方块) */
-  interactBlock (x: number, y: number, z: number) {
+  interactBlock (x: number, y: number, z: number) { this.useOnBlock(x, y, z, 1) }
+
+  /** 手持物对方块某面右键 (手持方块时 = 放置; face 同 digStart) */
+  useOnBlock (x: number, y: number, z: number, face: number) {
     this.client.write('block_place', {
       hand: 'main_hand',
       location: { x, y, z },
-      direction: 1,
+      direction: face,
       cursorX: 0.5, cursorY: 0.5, cursorZ: 0.5,
       insideBlock: false,
       worldBorderHit: false,
@@ -848,6 +894,7 @@ export class BotAgent {
     })
   }
 
+  /** 关窗口 (0 = 玩家背包: 2×2 合成格残留物品退回背包) */
   closeWindow (windowId: number) {
     this.client.write('close_window', { windowId })
     this.inventory.close(windowId)
@@ -929,7 +976,7 @@ class RespawnAction extends AsyncAction {
 // ---------- 聊天 NBT 文本提取 ----------
 
 const EN_LANG: Record<string, string> = (() => {
-  try { return createRequire(import.meta.url)('minecraft-data')('26.3').language ?? {} } catch { return {} }
+  return mcData.language ?? {}
 })()
 
 const TRANSLATE_ZH: Record<string, string> = {

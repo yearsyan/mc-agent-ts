@@ -4,11 +4,7 @@
  * - 实体追踪 (spawn/move/teleport/destroy, 26.3 entityDelta 格式)
  * - 方块查询 / 最高方块 / 附近实体
  */
-import { createRequire } from 'node:module'
-
-const require2 = createRequire(import.meta.url)
-const mcData: any = require2('minecraft-data')('26.3')
-const Chunk: any = require2('prismarine-chunk')('26.3')
+import { mcData, Chunk } from '../version.js'
 
 export interface TrackedEntity {
   id: number
@@ -52,6 +48,11 @@ for (const n of AIR) {
   if (b) for (let s = b.minStateId; s <= b.maxStateId; s++) AIR_STATES.add(s)
 }
 export const blockName = (stateId: number) => NAME_BY_STATE[stateId] ?? `unknown_${stateId}`
+
+/** 实体元数据下标 → 字段名 (minecraft-data metadataKeys, 如 player 的 0 = shared_flags); 下标随版本变, 业务代码只认名字 */
+export function metaKeyName (entityType: string, key: number): string | undefined {
+  return mcData.entitiesByName[entityType]?.metadataKeys?.[key]
+}
 
 /** section 内可能出现的 stateId; null = 直接调色板 (无法预判, 需逐格扫描) */
 function sectionStates (section: any): number[] | null {
@@ -293,11 +294,16 @@ export class World {
     }
   }
 
+  /** 实体元数据下标 → 字段名 (按该实体类型的 metadataKeys; 未知实体返回下标字符串) */
+  metaKeyName (entityId: number, key: number): string {
+    const e = this.entities.get(entityId)
+    return (e && metaKeyName(e.type, key)) ?? String(key)
+  }
+
   setEntityMeta (entityId: number, key: number, value: any) {
     const e = this.entities.get(entityId)
     if (!e) return
-    const keys: string[] | undefined = mcData.entitiesByName[e.type]?.metadataKeys
-    e.meta[keys?.[key] ?? String(key)] = value
+    e.meta[this.metaKeyName(entityId, key)] = value
   }
 
   trackMove (entityId: number, dx: number, dy: number, dz: number) {

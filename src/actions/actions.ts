@@ -6,6 +6,7 @@ import type { BotAgent } from '../conn/bot.js'
 import { findPath, placementsIn, isOpenable, isDiggable, MAX_WATER_DROP, type PathNode } from './astar.js'
 import { RouteLog, settleWithRoute, proposalText, judgeProposal, posKey, type RouteProposal, type DigStep, type Pos3, type Approval } from './route.js'
 import { Action, AsyncAction } from './base.js'
+import { SLOT, LAST_STORAGE, PLAYER_STORAGE, hotbarSlot, containerSize, toWindowSlot } from '../conn/inventory.js'
 import { fluidHeight } from '../physics/runner.js'
 import { holdSlot, holdItem, holdNothing, prepareHeld, placeBlockAt, faceTowards, reachTo, closeContainer, canReach, boxDist, eyeOf, REACH } from './hands.js'
 import { bestToolFor, toolKind, weaponScore, blockProps, blockInfo, SCAFFOLD_BLOCKS, isWatery, isNaturalBlock } from '../game/knowledge.js'
@@ -518,19 +519,19 @@ export class MoveToAction extends Action {
       this.digSentAt = nowMs
       this.digStopSent = false
       faceTowards(bot, wp.x + 0.5, this.digY + 0.5, wp.z + 0.5)
-      bot.client.write('block_dig', { status: 0, location: { x: wp.x, y: this.digY, z: wp.z }, face: this.digFace(wp), sequence: bot.nextSequence() })
+      bot.digStart(wp.x, this.digY, wp.z, this.digFace(wp))
       this.lastProgressAt = nowMs
     }
     if (!this.digStopSent && nowMs - this.digSentAt >= this.digEstMs) {
       this.digStopSent = true
-      bot.client.write('block_dig', { status: 3, location: { x: wp.x, y: this.digY, z: wp.z }, face: this.digFace(wp), sequence: bot.nextSequence() })
+      bot.digFinish(wp.x, this.digY, wp.z, this.digFace(wp))
     }
     if (nowMs - this.digSentAt > this.digEstMs + 4000) {
       // 服务器没破坏: 重来一次 (重发 START 会重置进度, 所以只在超时后)
       if (++this.digTries > 2) { this.stopMoving(); this.fail(`挖不动 ${b.name} (${wp.x},${this.digY},${wp.z})`); return true }
       this.digSentAt = 0
     }
-    if (nowMs % 300 < 50) bot.client.write('arm_animation', { hand: 'main_hand' })
+    if (nowMs % 300 < 50) bot.swing()
     this.lastProgressAt = Math.max(this.lastProgressAt, nowMs - 15000)
     return true
   }
@@ -794,7 +795,7 @@ export class DigAction extends AsyncAction {
     await this.sleep(60) // 朝向随下一 tick 发出
     const face = this.pickFace()
     const t0 = Date.now()
-    bot.client.write('block_dig', { status: 0, location: { x, y, z }, face, sequence: bot.nextSequence() })
+    bot.digStart(x, y, z, face)
     let stopSent = false, lastSwing = 0
     for (;;) {
       const now = Date.now()
@@ -803,9 +804,9 @@ export class DigAction extends AsyncAction {
         const how = tool.name ? `用 ${tool.name}` : '空手'
         return `已挖掉 ${b.name} (${x},${y},${z}) ${how}, ${((now - t0) / 1000).toFixed(1)}s${tool.harvest ? '' : ' (工具不对, 不会掉落)'}`
       }
-      if (now - lastSwing > 300) { lastSwing = now; bot.client.write('arm_animation', { hand: 'main_hand' }) }
-      // 26.3: 3=STOP_DESTROY (2 是 ABORT); 不重发 START (会重置服务器进度)
-      if (!stopSent && now - t0 >= estMs) { stopSent = true; bot.client.write('block_dig', { status: 3, location: { x, y, z }, face, sequence: bot.nextSequence() }) }
+      if (now - lastSwing > 300) { lastSwing = now; bot.swing() }
+      // 不重发 START (会重置服务器进度)
+      if (!stopSent && now - t0 >= estMs) { stopSent = true; bot.digFinish(x, y, z, face) }
       if (now - t0 > estMs + 5000) throw new Error(`方块未变化 (预计 ${(estMs / 1000).toFixed(1)}s)`)
       await this.sleep(50)
     }
@@ -825,7 +826,7 @@ export class PlaceAction extends AsyncAction {
     if (b && !AIRISH.has(b.name) && !isSoft(b.name) && b.name !== 'water') throw new Error(`(${x},${y},${z}) 已有方块 ${b.name}`)
     if (!canReach(bot, x, y, z)) throw new Error(`距离 ${boxDist(eyeOf(bot), x, y, z).toFixed(1)} 超出触及范围 ${REACH}`)
     if (this.opts.item) await holdItem(this, bot, this.opts.item)
-    else if (this.opts.hotbar !== undefined) await holdSlot(this, bot, 36 + this.opts.hotbar)
+    else if (this.opts.hotbar !== undefined) await holdSlot(this, bot, hotbarSlot(this.opts.hotbar))
     const held = bot.inventory.held()
     if (!held) throw new Error('手里没有东西可放')
     faceTowards(bot, x + 0.5, y + 0.5, z + 0.5)
@@ -885,7 +886,7 @@ export class ChestOpAction extends Action {
     const wid = this.bot.inventory.activeWindowId
     if (wid === null) return this.fail('容器已被关闭')
     const w = this.bot.inventory.windows.get(wid)
-    const size = (w?.slots.length ?? 63) - 36 // 容器自身格数 (单箱 27, 大箱 54)
+    const size = containerSize(w?.slots.length ?? 27 + PLAYER_STORAGE) // 容器自身格数 (单箱 27, 大箱 54)
     // 窗口布局: 0..size-1 容器, size..size+26 背包, size+27..size+35 快捷栏
     if (this.phase === 'take') {
       if (this.slot < 0 || this.slot >= size) return this.fail(`take 槽位须为 0-${size - 1} (容器区), 收到 ${this.slot}`)
@@ -897,9 +898,9 @@ export class ChestOpAction extends Action {
     }
     if (this.phase === 'put') {
       // slot = 玩家背包槽(9-44) → 窗口坐标 size + (slot - 9)
-      if (this.slot < 9 || this.slot > 44) return this.fail('put 槽位须为 9-44 (玩家物品)')
+      if (this.slot < SLOT.main || this.slot > LAST_STORAGE) return this.fail(`put 槽位须为 ${SLOT.main}-${LAST_STORAGE} (玩家物品)`)
       if (!this.bot.inventory.slots[this.slot]) return this.fail(`背包槽位 ${this.slot} 是空的`)
-      this.bot.clickSlot(wid, size + this.slot - 9, 0, 1) // shift 点击: 直接进容器
+      this.bot.clickSlot(wid, toWindowSlot(this.slot, size), 0, 1) // shift 点击: 直接进容器
       this.clickedAt = nowMs
       this.phase = 'done'
       return

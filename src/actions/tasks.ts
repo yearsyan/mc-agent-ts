@@ -9,6 +9,7 @@ import { RouteLog, settleWithRoute, proposalCost, type RouteProposal, type Appro
 import { standableCell } from './astar.js'
 import { holdSlot, holdItem, holdNothing, closeContainer, faceTowards, canReach, canSee, boxDist, eyeOf, REACH } from './hands.js'
 import type { Action } from './base.js'
+import { SLOT, PLAYER_STORAGE, SWAP_OFFHAND_BUTTON, containerSize, toWindowSlot } from '../conn/inventory.js'
 import { mcData, itemName, itemId, foodScore, fuelTicks, blockProps, bestToolFor, harvestToolNames } from '../game/knowledge.js'
 
 const AIRISH = new Set(['air', 'cave_air', 'void_air'])
@@ -80,12 +81,16 @@ function exposed (bot: BotAgent, x: number, y: number, z: number) {
  * - 够不着 → 只走现成的路试接近点 (看得见的优先); 获准改地形 (allow_* / confirm) 才垫高/挖进去;
  *   未获准又走不到时, 算出改动最少的挖/搭方案放进任务的 extra.proposals 并失败, 由 LLM 决定
  */
-async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: number, what: string): Promise<string> {
-  const here = canReach(bot, x, y, z)
+async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: number, what: string, within?: (feet: { x: number, y: number, z: number }) => boolean): Promise<string> {
+  // within: 额外的站位约束 (如床要求脚在床 3 格内), 按脚的位置判断
+  const inRange = (p: { x: number, y: number, z: number }) => !within || within(p)
+  const spotOk = (s: { x: number, y: number, z: number }) => inRange({ x: s.x + 0.5, y: s.y, z: s.z + 0.5 })
+  const reached = () => canReach(bot, x, y, z) && inRange(bot.pos)
+  const here = reached()
   if (here && canSee(bot.world, eyeOf(bot), x, y, z)) return ''
   const { allowDig, allowPlace, approved } = act.moveOpts
   const canDig = allowDig || !!approved?.dig.size, canPlace = allowPlace || !!approved?.place.size
-  const all = approachSpots(bot, x, y, z)
+  const all = approachSpots(bot, x, y, z).filter(spotOk)
   const approach = (here ? all.filter(s => s.visible) : all).slice(0, 3)
   let err = ''
   const at = (s: { x: number, y: number, z: number }, seen = canSee(bot.world, eyeOf(bot), x, y, z)) =>
@@ -93,7 +98,7 @@ async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: nu
   const tryAll = async (spots: { x: number, y: number, z: number }[], opts: MoveOptions) => {
     for (const spot of spots) {
       const mv = await act.subMove(spot, { tolerance: 0, ...opts })
-      if (mv.status === 'done' && canReach(bot, x, y, z)) return at(spot)
+      if (mv.status === 'done' && reached()) return at(spot)
       err = mv.status === 'done' ? '到了但还是够不着' : mv.detail
     }
     return null
@@ -102,8 +107,9 @@ async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: nu
   const r1 = await tryAll(approach, { allowDig: false, allowPlace: false })
   if (r1) return r1
   if (here) return '原地操作 (看不到它, 附近也没有看得见的站位, 隔着方块)'
-  const pillar = pillarSpot(bot, x, y, z)
-  const digIn = digInSpots(bot, x, y, z)
+  const pillar0 = pillarSpot(bot, x, y, z)
+  const pillar = pillar0 && spotOk(pillar0) ? pillar0 : null
+  const digIn = digInSpots(bot, x, y, z).filter(spotOk)
   // 第二轮: 已获准改地形 (整趟允许或按方案确认), 带权限再试 (接近点 → 垫高点 → 挖进去)
   if (canDig || canPlace) {
     const spots = [...approach, ...(canPlace && pillar ? [pillar] : []), ...(canDig ? digIn : [])]
@@ -113,14 +119,15 @@ async function reachBlock (act: Task, bot: BotAgent, x: number, y: number, z: nu
     throw new Error(`走到${what}失败: ${err}`)
   }
   // 未获准: 对垫高点/挖进点/最近接近点算方案, 取最好的
-  const cands = [pillar ?? pillarSpot(bot, x, y, z, 64), digIn[0], approach[0]]
+  const hypo = pillar ?? pillarSpot(bot, x, y, z, 64)
+  const cands = [hypo && spotOk(hypo) ? hypo : null, digIn[0], approach[0]]
     .filter((c): c is { x: number, y: number, z: number } => !!c).slice(0, 2)
   let best: { mv: MoveToAction, props: RouteProposal[] } | null = null
   // 有推荐方案的优先, 其次改动最少
   const cost = (ps: RouteProposal[]) => Math.min(...ps.map(p => (p.recommended ? 0 : 1000) + proposalCost(p)))
   for (const spot of cands) {
     const mv = await act.subMove(spot, { tolerance: 0, allowDig: false, allowPlace: false, propose: true })
-    if (mv.status === 'done' && canReach(bot, x, y, z)) return at(spot)
+    if (mv.status === 'done' && reached()) return at(spot)
     const props = (mv.extra?.proposals as RouteProposal[] | undefined) ?? []
     if (props.length && (!best || cost(props) < cost(best.props))) best = { mv, props }
     else if (!best) err = mv.status === 'done' ? '到了但还是够不着' : mv.detail
@@ -234,7 +241,7 @@ export abstract class Task extends AsyncAction {
     const cur = bot.inventory.cursor
     if (!cur) return
     const same = bot.inventory.find(s => s.name === cur.name && s.count < 64)[0]
-    const empty = [...Array(36).keys()].map(i => 9 + i).find(i => !bot.inventory.slots[i])
+    const empty = [...Array(PLAYER_STORAGE).keys()].map(i => SLOT.main + i).find(i => !bot.inventory.slots[i])
     const dst = same?.slot ?? empty
     if (dst === undefined) throw new Error('背包满了, 光标上的物品放不回去')
     const before = bot.inventory.slots[dst]?.count ?? 0
@@ -301,7 +308,7 @@ export class CraftAction extends Task {
       const t = await this.ensureStation('crafting_table', '工作台')
       wid = this.wid = await this.openAt(t.x, t.y, t.z, 46, '工作台')
       gridW = 3
-      toWin = (s: number) => s + 1 // 工作台窗口: 0 产物, 1-9 网格, 10-36 背包, 37-45 快捷栏
+      toWin = (s: number) => toWindowSlot(s, 10) // 工作台窗口: 0 产物, 1-9 网格, 之后是玩家物品
     } else closeContainer(bot)
 
     const resultName = itemName(r.resultId)
@@ -330,7 +337,7 @@ export class CraftAction extends Task {
 
   protected cleanup () {
     if (this.wid !== null) this.bot.closeWindow(this.wid)
-    else try { this.bot.client.write('close_window', { windowId: 0 }) } catch {} // 关背包: 网格残留物品退回背包
+    else try { this.bot.closeWindow(0) } catch {} // 关背包: 网格残留物品退回背包
   }
 }
 
@@ -352,7 +359,7 @@ export class SmeltAction extends Task {
 
     const t = await this.ensureStation('furnace', '熔炉')
     const wid = this.wid = await this.openAt(t.x, t.y, t.z, 39, '熔炉')
-    const toWin = (s: number) => s - 6 // 熔炉窗口: 0 原料, 1 燃料, 2 产物, 3-29 背包, 30-38 快捷栏
+    const toWin = (s: number) => toWindowSlot(s, 3) // 熔炉窗口: 0 原料, 1 燃料, 2 产物, 之后是玩家物品
     const slot = (i: number) => this.winSlot(wid, i)
     const taken: Record<string, number> = {}
     const takeOutput = async () => {
@@ -467,7 +474,7 @@ export class CollectAction extends Task {
 
 // ---------- 装备 / 进食 / 使用物品 ----------
 
-const ARMOR_SLOT: [RegExp, number][] = [[/_helmet$|^carved_pumpkin$|_skull$|_head$/, 5], [/_chestplate$|^elytra$/, 6], [/_leggings$/, 7], [/_boots$/, 8]]
+const ARMOR_SLOT: [RegExp, number][] = [[/_helmet$|^carved_pumpkin$|_skull$|_head$/, SLOT.armor], [/_chestplate$|^elytra$/, SLOT.armor + 1], [/_leggings$/, SLOT.armor + 2], [/_boots$/, SLOT.armor + 3]]
 
 export class EquipAction extends Task {
   constructor (bot: BotAgent, private item: string) { super(bot, 'equip') }
@@ -485,8 +492,8 @@ export class EquipAction extends Task {
       return `已穿上 ${this.item}`
     }
     if (this.item === 'shield' || this.item === 'totem_of_undying') {
-      bot.clickSlot(0, hit.slot, 40, 2) // 与副手交换
-      await this.until(() => bot.inventory.slots[45]?.name === this.item, 2000, '放到副手')
+      bot.clickSlot(0, hit.slot, SWAP_OFFHAND_BUTTON, 2) // 与副手交换
+      await this.until(() => bot.inventory.offhand()?.name === this.item, 2000, '放到副手')
       return `已把 ${this.item} 放到副手`
     }
     await holdSlot(this, bot, hit.slot)
@@ -539,7 +546,7 @@ export class UseItemAction extends Task {
     bot.useItem()
     if (this.holdMs > 0) {
       await this.sleep(Math.min(this.holdMs, 10_000))
-      bot.client.write('block_dig', { status: 6, location: { x: 0, y: 0, z: 0 }, face: 0, sequence: 0 }) // 26.3: 6 = RELEASE_USE_ITEM
+      bot.releaseUseItem()
     } else await this.sleep(200)
     return `使用了 ${held.name}${this.holdMs ? ` (按住 ${this.holdMs}ms)` : ''}`
   }
@@ -589,7 +596,9 @@ export class SleepAction extends Task {
       bed = all[0]
       if (!bed) throw new Error('24 格内没有床')
     }
-    await reachBlock(this, bot, bed.x, bed.y, bed.z, '床')
+    // 原版: 脚离床 (底面中心) 水平 ≤3、竖直 ≤2 才能睡, 比触及范围严
+    const b = bed
+    await reachBlock(this, bot, b.x, b.y, b.z, '床', p => Math.abs(p.x - (b.x + 0.5)) <= 2.8 && Math.abs(p.z - (b.z + 0.5)) <= 2.8 && Math.abs(p.y - b.y) <= 1.8)
     await holdNothing(this, bot)
     const chatSeq = bot.chat.at(-1)?.seq ?? 0
     faceTowards(bot, bed.x + 0.5, bed.y + 0.3, bed.z + 0.5)
@@ -649,9 +658,9 @@ export class DismountAction extends Task {
   protected async run () {
     const bot = this.bot
     if (bot.vehicleId === null) return '本来就没骑着东西'
-    bot.client.write('player_input', { inputs: { shift: true } })
+    bot.setSneakInput(true)
     await this.until(() => bot.vehicleId === null, 2000, '下坐骑')
-    bot.client.write('player_input', { inputs: {} })
+    bot.setSneakInput(false)
     return '已下来'
   }
 }
@@ -661,7 +670,7 @@ export class WakeAction extends Task {
   protected async run () {
     const bot = this.bot
     if (!bot.sleeping) return '没在睡觉'
-    bot.client.write('entity_action', { entityId: bot.entityId, actionId: 'stop_sleeping', jumpBoost: 0 })
+    bot.stopSleeping()
     await this.until(() => !bot.sleeping, 2000, '起床')
     return '已起床'
   }
@@ -693,10 +702,10 @@ export class TradeAction extends Task {
     const o = offers[this.index]
     if (!o) throw new Error(`没有第 ${this.index} 项交易 (共 ${offers.length} 项)`)
     if (o.disabled) throw new Error(`第 ${this.index} 项交易已售罄`)
-    const toWin = (s: number) => s - 6 // 交易窗口: 0/1 付款, 2 产物, 3-29 背包, 30-38 快捷栏
+    const toWin = (s: number) => toWindowSlot(s, 3) // 交易窗口: 0/1 付款, 2 产物, 之后是玩家物品
     let done = 0
     for (; done < this.times; done++) {
-      bot.client.write('select_trade', { slot: this.index }) // 服务器自动把付款物品从背包填进 0/1 格
+      bot.selectTrade(this.index) // 服务器自动把付款物品从背包填进 0/1 格
       try { await this.until(() => !!this.winSlot(wid, 2), 1200, '交易产物') } catch { break }
       bot.clickSlot(wid, 2, 0, 0) // 左键取 (shift 会一直交易到材料用完)
       await this.until(() => !!bot.inventory.cursor, 1500, '取到产物')
@@ -783,13 +792,14 @@ export class ChestTransferAction extends Task {
     const wid = bot.inventory.activeWindowId
     if (wid === null) throw new Error('没有打开的容器 (给 x,y,z 会自动走过去打开)')
     const w = bot.inventory.windows.get(wid)
-    const size = (w?.slots.length ?? 0) - 36
+    const size = containerSize(w?.slots.length ?? 0)
     if (!w || size <= 0) throw new Error('当前窗口不是容器')
 
-    // 窗口坐标: 0..size-1 容器, size..size+35 玩家背包
+    // 窗口坐标: 0..size-1 容器, 之后 PLAYER_STORAGE 格是玩家背包+快捷栏
     const take = this.dir === 'take'
-    const src = take ? [0, size] : [size, size + 36]
-    const dst = take ? [size, size + 36] : [0, size]
+    const mine = [size, size + PLAYER_STORAGE]
+    const src = take ? [0, size] : mine
+    const dst = take ? mine : [0, size]
     const name = this.item
     const sum = ([a, b]: number[]) => { let n = 0; for (let i = a; i < b; i++) if (w.slots[i]?.name === name) n += w.slots[i]!.count; return n }
     const maxStack = mcData.itemsByName[name]?.stackSize ?? 64

@@ -16,6 +16,7 @@ import {
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js'
 import { BotAgent } from '../conn/bot.js'
+import { SLOT, isHotbar, hotbarIndex, containerSize } from '../conn/inventory.js'
 import { ScriptAction } from '../actions/script.js'
 import type { Action } from '../actions/base.js'
 import { renderView, renderMap, pngBuffer, lookAtBlock, type EntityKind, type ViewEntity } from '../vision/render.js'
@@ -468,7 +469,7 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
     case 'list_inventory': {
       // 每格标注所在区域, 免得 LLM 自己记槽位编号
       const inv = bot.inventory
-      const where = (s: number) => s === 0 ? '合成产物' : s <= 4 ? '合成格' : s <= 8 ? ['头盔', '胸甲', '护腿', '靴子'][s - 5] : s <= 35 ? '背包' : s <= 44 ? `快捷栏${s - 36}${s - 36 === inv.heldSlot ? ' (手持)' : ''}` : '副手'
+      const where = (s: number) => s === SLOT.craftResult ? '合成产物' : s < SLOT.armor ? '合成格' : s < SLOT.main ? ['头盔', '胸甲', '护腿', '靴子'][s - SLOT.armor] : s < SLOT.hotbar ? '背包' : isHotbar(s) ? `快捷栏${hotbarIndex(s)}${hotbarIndex(s) === inv.heldSlot ? ' (手持)' : ''}` : '副手'
       return txt(JSON.stringify({
         held: inv.held() ? { name: inv.held()!.name, count: inv.held()!.count, hotbar: inv.heldSlot } : null,
         summary: inv.summary(),
@@ -483,7 +484,7 @@ async function handleTool (role: Role, toolName: string, args: any): Promise<any
       if (wid === null) return txt(JSON.stringify({ open: false }))
       const w = bot.inventory.windows.get(wid)
       const all = w?.slots ?? []
-      const size = Math.max(0, all.length - 36) // 末尾 36 格是玩家背包
+      const size = containerSize(all.length) // 末尾是玩家背包+快捷栏
       const o = bot.openedContainer?.windowId === wid ? bot.openedContainer : null
       const cont = all.slice(0, size).map((s: any, i: number) => s ? { slot: i, name: s.name, count: s.count } : null).filter(Boolean)
       const totals: Record<string, number> = {}

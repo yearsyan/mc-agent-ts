@@ -109,11 +109,31 @@ LLM 决策要数秒，保命行为由 bot 每 tick 自主执行，打断主动�
 
 ## 目录
 
-- `src/conn/` — bot.ts（连接/tick/动作/聊天/死亡）、reflex.ts（反射层）、inventory.ts
+- `src/version.ts` — 游戏版本单一来源：`MC_VERSION`/协议号 + `mcData`/`Block`/`Chunk` 单例（其他模块不自己 require minecraft-data）
+- `src/conn/` — bot.ts（连接/tick/动作/聊天/死亡；**所有发包都在这里**）、reflex.ts（反射层）、inventory.ts（库存 + 槽位布局常量 `SLOT`）
 - `src/actions/` — base.ts（Action/AsyncAction 框架）、actions.ts（移动/挖掘/容器）、tasks.ts（采集/合成/交互/交易）、combat.ts（远程战斗：弹道+瞄准）、script.ts（run_script 脚本引擎）、hands.ts（手持/背包操作）、astar.ts
 - `src/world/` `src/physics/` `src/vision/` `src/game/` — 世界模型 · 物理适配 · raycast 渲染 · 物品/方块知识（knowledge.ts）+ 弹道（ballistics.ts）
 - `src/http/` — serve.ts（MCP+REST+WebUI 单服务、工具注册与角色过滤）、tokens.ts、oplog.ts、webui.html
 - `third_party/` — 26.2/26.3 协议数据（minecraft-data PR #1301, MIT, 见 NOTICE.md）· `scripts/setup-overlay.ts` 可重现 patch
+
+## 版本适配分层与升级检查清单
+
+只支持一个游戏版本（当前 26.3 / 协议 777），不做多版本兼容。但版本相关的东西收在固定位置，升级时按下表逐项核对：
+
+| 层 | 位置 | 升级时做什么 |
+|---|---|---|
+| 版本号 | `src/version.ts` | 改 `MC_VERSION` / `PROTOCOL_VERSION`；启动时会核对 minecraft-data 的协议号 |
+| 协议数据 | `third_party/minecraft-data-*` + `scripts/setup-overlay.ts` | 换成新版数据，`dataPaths` 里沿用旧版的文件（attributes/language/materials/sounds 等）逐个确认；overlay 靠字符串锚点改依赖，依赖升级后看脚本有没有打警告 |
+| 协议补丁 | `third_party/patches/*.diff` | 上游已合并就删掉，否则重打 |
+| 发包 | `src/conn/bot.ts`（`digStart/digFinish/releaseUseItem/useOnBlock/attackEntity/clickSlot/...`，`DIG_STATUS`） | 动作代码不直接 `client.write`；包名/字段/枚举值的变化只改这里 |
+| 收包 | `src/conn/bot.ts`、`src/world/world.ts`、`src/conn/inventory.ts` | `grep -n '26\.3' src/conn src/world` 找出标注过的版本相关字段 (entityDelta、position flags、multi_block_change 等) 逐个核对 |
+| 实体元数据 | `metaKeyName()`（world.ts） | 一律按 minecraft-data `metadataKeys` 的名字取，不写下标；新版改名时只需核对名字（`shared_flags/air_supply/pose/item/swell_dir/in_ground/living_entity_flags`…） |
+| 槽位布局 | `SLOT` / `containerSize` / `toWindowSlot`（inventory.ts） | 核对玩家窗口和容器窗口布局；业务代码不写裸槽位号 |
+| 运行时注册表 | `registry_data`（维度/伤害类型/聊天类型）、`dimension.ts` | 从服务器读，通常不用改；`parseDimType` 兼容新旧两种字段格式 |
+| 游戏规则表 | `src/game/knowledge.ts`（工具速度/挖掘等级/攻速/武器伤害/天然方块） | 手写数据，新材质或数值调整不会报错只会算错，要对照版本更新日志 |
+| 物理 | `prismarine-physics`（overlay 补版本号）+ `physics/runner.ts` 自己的游泳模拟 | 移动数值有变化时实测核对 |
+
+升级后验证：`pnpm exec tsc --noEmit` → `pnpm setup` 看 overlay 输出 → 在**临时拷贝的服务器**上实测登录、移动、挖、放、开箱、战斗、换维度。
 
 ## 已验证能力（测试服实测）
 

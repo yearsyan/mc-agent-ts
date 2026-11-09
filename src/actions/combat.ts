@@ -3,6 +3,7 @@
  */
 import type { BotAgent } from '../conn/bot.js'
 import { Task } from './tasks.js'
+import { HOTBAR_SIZE } from '../conn/inventory.js'
 import { holdSlot, faceTowards, eyeOf, entityBoxDist, canSeePoint } from './hands.js'
 import { aimAt, traceArrow, type Aim } from '../game/ballistics.js'
 import { entityVelocity } from '../world/world.js'
@@ -59,8 +60,7 @@ export class AttackAction extends Task {
       if (wait > 0) { faceTowards(bot, center.x, center.y, center.z); await this.sleep(Math.min(wait, 200)); continue }
       faceTowards(bot, center.x, center.y, center.z)
       bot.reflex.lowerShield() // 举着盾不能攻击
-      bot.client.write('attack', { entityId: this.entityId }) // 26.3: 攻击是独立的 attack 包
-      bot.client.write('arm_animation', { hand: 'main_hand' })
+      bot.attackEntity(this.entityId)
       hits++
       lastHit = Date.now()
     }
@@ -128,7 +128,7 @@ export class ShootAction extends Task {
   private abortDraw () {
     const bot = this.bot
     const cur = bot.inventory.heldSlot
-    bot.selectSlot((cur + 1) % 9)
+    bot.selectSlot((cur + 1) % HOTBAR_SIZE)
     bot.selectSlot(cur)
     bot.usingHand = null
   }
@@ -157,7 +157,7 @@ export class ShootAction extends Task {
       if (!arrowCount(bot)) { stopReason = '箭用完了'; break }
       const bow = bowSlot(bot)
       if (bow === null) { stopReason = '弓没了 (耐久耗尽?)'; break }
-      if (bot.inventory.slots[36 + bot.inventory.heldSlot]?.name !== 'bow') await holdSlot(this, bot, bow)
+      if (bot.inventory.held()?.name !== 'bow') await holdSlot(this, bot, bow)
 
       // 等出现射击窗口 (视线畅通、射程内)
       let shot = solveShot(bot, this.entityId)

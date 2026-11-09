@@ -1,12 +1,9 @@
 /**
  * 游戏知识: 物品/方块属性, 工具选择, 挖掘耗时, 食物, 燃料, 垫脚方块, 敌对生物。
- * 数据来自 minecraft-data 26.3; 工具速度按物品名推断 (矿石的 material 是 incorrect_for_*_tool, 无法直接查表)。
+ * 数据来自 minecraft-data (版本见 version.ts); 工具速度按物品名推断 (矿石的 material 是 incorrect_for_*_tool, 无法直接查表)。
  */
-import { createRequire } from 'node:module'
-
-const require2 = createRequire(import.meta.url)
-export const mcData: any = require2('minecraft-data')('26.3')
-const Block: any = require2('prismarine-block')(mcData)
+import { mcData, Block } from '../version.js'
+export { mcData }
 
 export const itemName = (id: number): string => mcData.items[id]?.name ?? `item_${id}`
 export const itemId = (name: string): number | undefined => mcData.itemsByName[name]?.id

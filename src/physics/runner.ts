@@ -11,10 +11,9 @@
 import { createRequire } from 'node:module'
 import { Vec3 } from 'vec3'
 import type { World } from '../world/world.js'
+import { mcData, Block, MC_VERSION } from '../version.js'
 
 const require2 = createRequire(import.meta.url)
-const mcData: any = require2('minecraft-data')('26.3')
-const Block: any = require2('prismarine-block')(mcData) // byRegistry? prismarine-block(registry)
 const { Physics, PlayerState } = require2('prismarine-physics')
 
 export interface ControlState {
@@ -127,7 +126,7 @@ export class PhysicsRunner {
     this.pworld = makePhysicsWorld(world)
     this.physics = Physics(mcData, this.pworld)
     this.botLike = {
-      version: '26.3',
+      version: MC_VERSION,
       entity: {
         position: new Vec3(bot.pos.x, bot.pos.y, bot.pos.z),
         velocity: new Vec3(0, 0, 0),
