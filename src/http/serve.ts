@@ -158,7 +158,7 @@ function scene (bot: BotAgent) {
     xp: { level: bot.xp.level, progress: +bot.xp.progress.toFixed(2) },
     ...(bot.gameMode !== 'survival' ? { game_mode: bot.gameMode } : {}),
     dimension: { name: bot.dimension.replace(/^minecraft:/, ''), min_y: bot.world.min_y, max_y: bot.world.min_y + bot.world.world_height - 1, ...(bot.world.hasCeiling ? { ceiling: true } : {}), ...(bot.dimInfo.bedWorks ? {} : { bed_explodes: true }) },
-    time: { day_time: bot.dayTime, night: isNight(bot.dayTime) },
+    time: { day_time: bot.dayTime, night: isNight(bot.dayTime), ...(bot.daylightCycle ? {} : { daylight_cycle_off: true }) },
     ...(bot.sleeping ? { sleeping: true } : {}),
     ...(bot.vehicleId !== null ? { riding: bot.vehicleId } : {}),
     ...(bot.swimming ? { swimming: true } : {}),

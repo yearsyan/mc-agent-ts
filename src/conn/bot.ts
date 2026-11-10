@@ -83,9 +83,25 @@ export class BotAgent {
   onGround = true
   /** 自己的实体 id (login 下发) */
   entityId = -1
-  /** 一天中的 tick (0-23999) / 世界总 tick */
-  dayTime = 0
+  /** 世界总 tick (update_time 的 age) */
   worldAge = 0
+  /**
+   * 维度时钟 (world clock)。26.x 的 update_time 只下发"纠偏值", 平时由客户端按 rate 自己推进
+   * (原版客户端每 tick 累加 partialTick; 参考 mineflayer 的 time 插件)。
+   * 若只在收包时赋值, 时间会永远停在登录那一刻, 是"白天却显示深夜"的根因。
+   * key = 维度注册表键 (overworld / the_nether / the_end); 没下发过的维度没有条目。
+   */
+  private clocks = new Map<string, { totalTicks: number, partialTick: number, rate: number }>()
+  /** 一天中的 tick (0-23999): 取当前维度的时钟, 服务端还没下发过时按 0 兜底 */
+  get dayTime (): number {
+    const c = this.clocks.get(dimKey(this.dimension))
+    return c ? (((Math.floor(c.totalTicks) % 24000) + 24000) % 24000) : 0
+  }
+  /** 世界时钟是否在走 (rate > 0); 服务端没下发过该维度时钟时按正常昼夜交替兜底 */
+  get daylightCycle (): boolean {
+    const c = this.clocks.get(dimKey(this.dimension))
+    return c ? c.rate > 0 : true
+  }
   /** 氧气 (满 300) / 是否着火 / 是否在床上 (来自自身 entity_metadata) */
   air = 300
   /** 经验: 等级 / 当前级进度 0~1 / 总经验 (experience 包) */
@@ -250,8 +266,12 @@ export class BotAgent {
       client.on('death_combat_event', (p: any) => { if (p.playerId === this.entityId) this.onDeath(p.message) })
       client.on('update_time', (p: any) => {
         this.worldAge = Number(p.age ?? 0)
-        const clock = p.clockUpdates?.[0]
-        if (clock) this.dayTime = Number(clock.totalTicks) % 24000
+        // clockUpdates 是按维度给的纠偏快照 (id = dimension_type 注册表下标), 可能只带其中一部分;
+        // 不能只认 [0] (那样会读到别的维度的时钟), 也不能指望它每 tick 都来 —— 常态推进在 advanceClocks()
+        for (const u of p.clockUpdates ?? []) {
+          const key = this.dimTypes[Number(u.id)]?.key ?? dimKey(this.dimension)
+          this.clocks.set(key, { totalTicks: Number(u.totalTicks), partialTick: Number(u.partialTick ?? 0), rate: Number(u.rate ?? 0) })
+        }
       })
       client.on('damage_event', (p: any) => {
         this.entityDamagedAt.set(p.entityId, Date.now())
@@ -432,6 +452,16 @@ export class BotAgent {
     this.tickTimer = setInterval(() => this.tick(), TICK_MS)
   }
 
+  /** 推进各维度时钟 (原版客户端每 tick 做一次: partialTick += rate, 满 1 进位到 totalTicks) */
+  private advanceClocks () {
+    for (const c of this.clocks.values()) {
+      if (!c.rate) continue
+      c.partialTick += c.rate
+      const whole = Math.floor(c.partialTick)
+      if (whole) { c.totalTicks += whole; c.partialTick -= whole }
+    }
+  }
+
   private stopTicker () {
     if (this.tickTimer) clearInterval(this.tickTimer)
     this.tickTimer = null
@@ -457,6 +487,7 @@ export class BotAgent {
       return
     }
     this.lastPosSentAt = now
+    this.advanceClocks() // 世界时钟: 和原版客户端一样自己按 rate 走 (update_time 只是纠偏)
 
     // 驱动动作
     for (const a of this.actions.values()) {
@@ -1112,4 +1143,9 @@ const DEATH_ZH: Record<string, string> = {
 function plain (n: any): string {
   const t = extractText(n)
   return t || String(n ?? '?')
+}
+
+/** 维度名 → 注册表键 (minecraft:overworld → overworld) */
+function dimKey (name: string): string {
+  return String(name ?? '').replace(/^minecraft:/, '')
 }
