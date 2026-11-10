@@ -39,7 +39,7 @@ python3 scripts/mcp_call.py <角色|admin> tools/call '{"name":"get_scene","argu
 
 - **包管理只用 pnpm**（配置在 `pnpm-workspace.yaml`，锁文件 `pnpm-lock.yaml`）；不引入 npm/package-lock.json。装依赖、跑命令统一 `pnpm install` / `pnpm <script>` / `pnpm exec <bin>`。
 - **node_modules 是打过补丁的**：minecraft-protocol 被 `third_party/patches/nmp-entityDelta.diff` patch，minecraft-data 被 `scripts/setup-overlay.ts` overlay 26.3 数据。绝不手改 node_modules——协议数据的修正应落到 third_party/（可被 setup 脚本重现），升级依赖后要重跑 patch。pnpm 重跑 patch/overlay 时对已应用部分打 WARN 属正常（幂等重入）。
-- **新动作继承 Action/AsyncAction**（`src/actions/base.ts`）：Action 是每 tick 驱动 `step()` 的状态机；AsyncAction 用 async run() 写多步流程，支持子动作与取消传播。主动作互斥（新动作顶掉旧的）；死亡取消全部动作并在 detail 给死因。
+- **新动作继承 Action/AsyncAction**（`src/actions/base.ts`），并在动作规格表 `src/actions/registry.ts` 加一条（参数/说明/构造）——`act` 工具的描述、枚举、schema 和参数校验都由它生成，不要去 serve.ts 手写；改完跑 `pnpm check:actions` 核对 DESIGN 动作表：Action 是每 tick 驱动 `step()` 的状态机；AsyncAction 用 async run() 写多步流程，支持子动作与取消传播。主动作互斥（新动作顶掉旧的）；死亡取消全部动作并在 detail 给死因。
 - **反射层可打断 LLM 动作**：reflex.ts 按 set_policy 策略每 tick 自主执行（逃生 > 战斗 > 进食 > 回家），接管时在动作 detail 注明原因。给 LLM 加新能力时考虑是否也要加对应反射策略。
 - **别阻塞事件循环**：tick 门控是硬约束；渲染已分段让出循环（640×360 渲染 tick 延迟 ≤22ms），新增长耗时逻辑（渲染/寻路/扫描）也要分段或限流。
 - **MCP 工具三件套**：在 serve.ts `tool(...)` 注册 → handler 实现 → 需要的话加入 `QUERY_TOOLS`（只读集）。工具返回末尾统一附 `{inbox:...}` 消息收件箱提示。

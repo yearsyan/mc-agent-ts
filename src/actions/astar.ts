@@ -252,8 +252,10 @@ export function findPath (world: World, from: PathNode, to: PathNode, opts: Path
       }
 
       // 4) 下落: ≤4 格直接跳; 更高的只能落进现成的水里, 或有水桶时落地前倒水缓冲 (落地格须是空气才倒得下水)
+      // 先要平着走进那一列 (身体占 cur.y 和 cur.y+1) 才掉得下去: 头那格被挡 (如悬着一块草方块的坑) 就进不去
+      const canStepIn = passable(nx, cur.y + 1, nz) || isWater(nx, cur.y + 1, nz)
       let landed = false
-      for (let drop = 1; drop <= MAX_WATER_DROP && cornersClear(cur.y, 2); drop++) {
+      for (let drop = 1; drop <= MAX_WATER_DROP && canStepIn && cornersClear(cur.y, 2); drop++) {
         const ny = cur.y - drop
         if (!passable(nx, ny + 1, nz) && !isWater(nx, ny + 1, nz)) break // 途中受阻
         if (standable(nx, ny, nz)) {

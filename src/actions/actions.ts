@@ -384,7 +384,9 @@ export class MoveToAction extends Action {
     const finalWp = this.wpIdx >= this.path.length - 1
     const dyWp = wp.y - bot.pos.y
     // 游泳姿态时身体在水面下 ~0.2-0.6 格, 竖直判定放宽
-    const vertOk = bot.swimming ? Math.abs(dyWp) < 1.2 : wp.climb || wp.swim ? Math.abs(dyWp) < 0.45 : dyWp < 0.6
+    // 往下挖的航点 (竖井): 必须真的掉到那一层才算到。否则站在井口就"到达", 下一格接着从井口往下挖,
+    // 挖到第 5 格左右超出服务器的触及范围, 一直挖不动
+    const vertOk = bot.swimming ? Math.abs(dyWp) < 1.2 : wp.climb || wp.swim ? Math.abs(dyWp) < 0.45 : wp.dig === 'down' ? Math.abs(dyWp) < 0.6 : dyWp < 0.6
     const arriveR = finalWp ? (this.tol === 0 && !this.segmenting ? 0.4 : 2.0) : (wp.climb ? 0.6 : 1.6)
     if (distWp < arriveR && vertOk && !(finalWp && this.tol === 0 && !bot.onGround && !inWater && !wp.climb)) {
       if (finalWp) {
@@ -401,7 +403,7 @@ export class MoveToAction extends Action {
       return
     }
     // 航点跳跃: 下一航点已比当前近则跳过 (特殊航点不跳)
-    if (!finalWp && !wp.climb && !wp.swim) {
+    if (!finalWp && !wp.climb && !wp.swim && !wp.dig) {
       const nxt = this.path[this.wpIdx + 1]
       if (!nxt.place && !nxt.dig && !nxt.door && !nxt.climb && !nxt.waterDrop) {
         const dNext = Math.hypot(nxt.x + 0.5 - bot.pos.x, nxt.z + 0.5 - bot.pos.z)
@@ -510,6 +512,8 @@ export class MoveToAction extends Action {
       this.lastProgressAt = nowMs
       return true // 这格挖完了, 下个 tick 处理下一格
     }
+    // 还够不着 (离得远 / 在上面好几层): 先不挖, 照常往航点走, 走近了再挖
+    if (!this.digSentAt && !canReach(bot, wp.x, this.digY, wp.z)) { this.digY = null; return false }
     this.halt()
     if (!this.digSentAt) {
       if (!bot.tryLockHand(this.handOwner)) return true // 手被占用 (如在吃东西)
@@ -909,15 +913,51 @@ export class ChestOpAction extends Action {
   }
 }
 
-export class DropItemAction extends Action {
-  constructor (private bot: BotAgent, private slot: number, private all: boolean) { super('drop_item') }
-  start () {
-    if (!this.bot.inventory.slots[this.slot]) return this.fail(`槽位 ${this.slot} 为空`)
-    closeContainer(this.bot)
-    this.bot.clickSlot(0, this.slot, this.all ? 1 : 0, 4) // mode 4 = drop
-    this.finish(`已丢弃槽位 ${this.slot}${this.all ? ' 整组' : ' 单个'}`)
+/**
+ * 丢物品: 按物品名丢 count 个 (缺省 1; all = 全部, 可跨多组; 先丢背包里的, 再丢快捷栏的)。
+ * slot 只用来在同名多件时指定丢哪一格: 给了 item 就核对那格确实是它 (背包挪过位置时不会丢错)。
+ * 只给 slot 是旧用法 (丢那一格的 1 个 / all 整组)。
+ */
+export class DropItemAction extends AsyncAction {
+  constructor (bot: BotAgent, private o: { item?: string, count?: number, all?: boolean, slot?: number }) { super(bot, 'drop_item') }
+
+  protected async run () {
+    const { bot } = this
+    const inv = bot.inventory
+    const { item, slot } = this.o
+    let slots: number[]
+    if (slot != null) {
+      const s = inv.slots[slot]
+      if (!s) throw new Error(`槽位 ${slot} 是空的${item ? ` (背包里的 ${item} 可能挪过位置, 先 list_inventory 再看)` : ''}`)
+      if (item && s.name !== item) throw new Error(`槽位 ${slot} 里是 ${s.name}, 不是 ${item}: 没丢 (背包可能挪过位置, 先 list_inventory 再看)`)
+      slots = [slot]
+    } else {
+      // 先丢背包里的, 快捷栏 (手上常用的) 留到最后
+      slots = inv.find(s => s.name === item).map(h => h.slot).reverse()
+      if (!slots.length) throw new Error(`背包里没有 ${item}${inv.findItem(item!) ? ' (副手上有: 用 slot 指定那一格才丢)' : ''}`)
+    }
+    const name = item ?? inv.slots[slots[0]]!.name
+    const have = slots.reduce((n, i) => n + (inv.slots[i]?.count ?? 0), 0)
+    const want = this.o.all ? have : Math.min(have, this.o.count ?? 1)
+    closeContainer(bot)
+    let dropped = 0
+    for (const i of slots) {
+      while (dropped < want) {
+        const cur = inv.slots[i]
+        if (!cur || cur.name !== name) break
+        const whole = want - dropped >= cur.count
+        const before = cur.count
+        bot.clickSlot(0, i, whole ? 1 : 0, 4) // mode 4 = 丢弃: button 1 整组, 0 一个
+        await this.until(() => (inv.slots[i]?.name === name ? inv.slots[i]!.count : 0) < before, 2000, `${name} 丢出`)
+        dropped += before - (inv.slots[i]?.name === name ? inv.slots[i]!.count : 0)
+      }
+      if (dropped >= want) break
+    }
+    const left = inv.count(name)
+    this.extra = { ...this.extra, item: name, dropped, left }
+    const short = !this.o.all && (this.o.count ?? 1) > have ? ` (想丢 ${this.o.count}, ${slot != null ? '那一格' : '背包里'}只有 ${have})` : ''
+    return `丢了 ${name}×${dropped}${short}; 背包还剩 ${left}`
   }
-  step () {}
 }
 
 export class CloseWindowAction extends Action {

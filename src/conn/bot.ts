@@ -10,12 +10,11 @@ import { MC_VERSION, mcData } from '../version.js'
 import { World, metaKeyName } from '../world/world.js'
 import { parseDimType, vanillaDim, type DimType } from '../world/dimension.js'
 import { PhysicsRunner } from '../physics/runner.js'
-import { Inventory, SLOT } from './inventory.js'
+import { Inventory, SLOT, setEnchantmentNames } from './inventory.js'
 import { approvalOf, type RouteProposal, type Approval } from '../actions/route.js'
-import { MAX_MOVE_DIST, Action, MoveToAction, DigAction, PlaceAction, JumpAction, StopAction, SelectSlotAction, OpenContainerAction, ChestOpAction, DropItemAction, CloseWindowAction } from '../actions/actions.js'
-import { Task, ReachThen, ChestTransferAction, containerBlocked, CraftAction, SmeltAction, CollectAction, PickupItemsAction, EquipAction, EatAction, UseItemAction, UseBlockAction, SleepAction, WakeAction, InteractEntityAction, DismountAction, TradeAction } from '../actions/tasks.js'
-import { Reflex, homeDimension } from './reflex.js'
-import { ShootAction, AttackAction } from '../actions/combat.js'
+import { Action } from '../actions/actions.js'
+import { buildAction, isSideAction } from '../actions/registry.js'
+import { Reflex } from './reflex.js'
 import { itemName } from '../game/knowledge.js'
 import type { ChatMessage } from './types.js'
 import { AsyncAction } from '../actions/base.js'
@@ -57,8 +56,6 @@ export type BotEvent =
   | { kind: 'action', action: Action }
   | { kind: 'reflex', text: string }
 
-/** 不参与"主动作互斥"的动作: 纯库存/界面操作, 可与移动等并行 */
-const SIDE_ACTIONS = new Set(['select_slot', 'chest_take', 'chest_put', 'drop_item', 'close_window', 'equip', 'wake', 'dismount'])
 
 const FABRIC_CHANNELS = ['fabric:registry/sync', 'fabric:registry/sync/complete']
 
@@ -91,6 +88,10 @@ export class BotAgent {
   worldAge = 0
   /** 氧气 (满 300) / 是否着火 / 是否在床上 (来自自身 entity_metadata) */
   air = 300
+  /** 经验: 等级 / 当前级进度 0~1 / 总经验 (experience 包) */
+  xp = { level: 0, progress: 0, total: 0 }
+  /** 游戏模式 (login/respawn 的 worldState, game_state_change 3 更新) */
+  gameMode: 'survival' | 'creative' | 'adventure' | 'spectator' = 'survival'
   onFire = false
   sleeping = false
   /** 骑乘中的载具实体 id */
@@ -207,6 +208,7 @@ export class BotAgent {
         if (String(p.id).endsWith('damage_type')) this.damageTypes = names()
         else if (String(p.id).endsWith('chat_type')) this.chatTypes = names()
         else if (String(p.id).endsWith('dimension_type')) this.dimTypes = (p.entries ?? []).map(parseDimType)
+        else if (String(p.id).endsWith(':enchantment') || p.id === 'enchantment') setEnchantmentNames(names())
       })
       client.on('custom_payload', (p: any) => {
         if (p.channel === 'fabric:registry/sync') {
@@ -221,6 +223,7 @@ export class BotAgent {
         this.entityId = packet.entityId
         this.enterDimension(packet.worldState)
         this.loginDeath = packet.worldState?.death ?? null
+        this.setGameMode(packet.worldState?.gamemode)
         // player_loaded 不在此处发: 要等出生点区块到达 (见 tick 里的加载门控), 与原版客户端一致
         if (process.env.MC_WIRE_DEBUG && this.client.serializer) {
           this.client.serializer.on('data', (d: Buffer) => {
@@ -240,6 +243,7 @@ export class BotAgent {
       client.on('respawn', (p: any) => {
         this.firstTeleportAt = 0; this.loadedAt = 0; this.sprintSent = false; this.physics.swimming = false; this.sleeping = false; this.vehicleId = null
         this.enterDimension(p.worldState)
+        this.setGameMode(p.worldState?.gamemode)
         if (this.dead) this.onRespawned()
       })
       // 死亡: 服务器专门发给死者的包 (关了 showDeathMessages 时 message 为空); update_health≤0 作兜底
@@ -336,6 +340,9 @@ export class BotAgent {
       client.on('window_items', (p: any) => this.inventory.handleWindowItems(p))
       client.on('set_slot', (p: any) => this.inventory.handleSetSlot(p))
       client.on('open_window', (p: any) => this.inventory.handleOpenWindow(p))
+      client.on('craft_progress_bar', (p: any) => this.inventory.handleWindowProperty(p)) // 窗口属性: 附魔台选项 / 铁砧花费
+      client.on('experience', (p: any) => { this.xp = { level: p.level ?? 0, progress: p.experienceBar ?? 0, total: p.totalExperience ?? 0 } })
+      client.on('game_state_change', (p: any) => { if (p.reason === 'change_game_mode' || p.reason === 3) this.setGameMode(Math.round(p.gameMode)) })
       client.on('close_window', (p: any) => this.inventory.close(p.windowId))
       client.on('held_item_slot', (p: any) => { this.inventory.heldSlot = p.slot ?? p.slotId ?? 0 })
       client.on('set_player_inventory', (p: any) => this.inventory.handleSetPlayerInventory(p))
@@ -531,7 +538,6 @@ export class BotAgent {
 
   // ---------- 动作系统 ----------
 
-  /** 按类型构造动作 (不启动); 脚本里的子动作也走这里 */
   /** 记下寻路方案 (只留最近 60 个) */
   rememberProposals (ps: RouteProposal[]) {
     const now = Date.now()
@@ -540,7 +546,7 @@ export class BotAgent {
   }
 
   /** confirm 参数 → 批准的改动; 方案不存在/过期则抛错 */
-  private approvalFor (confirm: unknown): Approval | undefined {
+  approvalFor (confirm: unknown): Approval | undefined {
     if (confirm == null || confirm === '') return undefined
     const ids = (Array.isArray(confirm) ? confirm : String(confirm).split(',')).map(x => String(x).trim()).filter(Boolean)
     const ps = ids.map(id => {
@@ -551,78 +557,20 @@ export class BotAgent {
     return ps.length ? approvalOf(ps) : undefined
   }
 
-  /** ctx.script: 脚本里的子动作 (moveTo 默认不限路程, 脚本自己有超时与报告) */
+  /** 按类型构造动作 (不启动): 查动作规格表 (actions/registry.ts) 校验参数并构造; 脚本里的子动作也走这里
+   *  ctx.script: 脚本里的子动作 (moveTo 默认不限路程, 脚本自己有超时与报告) */
   makeAction (type: string, params: any, ctx: { script?: boolean } = {}): Action {
-    const int = (v: any, d?: number) => { const n = Math.floor(Number(v ?? d)); if (!Number.isFinite(n)) throw new Error(`参数缺失或不是数字 (动作 ${type})`); return n }
-    const xyz = () => [int(params.x), int(params.y), int(params.z)] as const
-    const str = (v: any, what: string) => { if (typeof v !== 'string' || !v) throw new Error(`${type} 需要参数 ${what}`); return v }
-    // 寻路改地形的权限: 默认只走现成的路, 走不通时动作失败并给出挖/搭方案, LLM 确认后带上开关重新下达
-    const flag = (v: any) => v === true || v === 'true' || v === 1
-    // confirm: "<方案id>" = 只批准该方案列出的改动 (比 allow_* 窄)
-    const moveOpts = { allowDig: flag(params.allow_dig), allowPlace: flag(params.allow_place), approved: this.approvalFor(params.confirm) }
-    // 单次寻路路程上限: LLM 下达的 move_to/go_home 默认 128 格, 可用 max_dist 调 (8~512); 脚本默认不限
-    const maxDistance = params.max_dist != null ? Math.max(8, Math.min(512, int(params.max_dist))) : ctx.script ? undefined : MAX_MOVE_DIST
-    let a: Action
-    switch (type) {
-      case 'move_to': a = new MoveToAction(this, { x: +params.x, y: params.y != null ? +params.y : undefined, z: +params.z }, { tolerance: params.tolerance != null ? Math.max(0, int(params.tolerance)) : undefined, ...moveOpts, maxDistance }); break
-      // dig / place / open_container: 先走到够得着且看得见的位置再操作 (ReachThen)
-      case 'dig': { const [x, y, z] = xyz(); a = new ReachThen(this, 'dig', { x, y, z }, () => new DigAction(this, x, y, z), this.world.getBlock(x, y, z)?.name ?? '方块'); break }
-      case 'place': { const [x, y, z] = xyz(); const o = { hotbar: params.hotbar != null ? int(params.hotbar) : undefined, item: params.item }; a = new ReachThen(this, 'place', { x, y, z }, () => new PlaceAction(this, x, y, z, int(params.face, 1), o), '放置点'); break }
-      case 'attack': a = new AttackAction(this, int(params.entity_id ?? params.entityId), int(params.hits, 3)); break
-      case 'shoot': a = new ShootAction(this, int(params.entity_id ?? params.entityId), Math.max(1, Math.min(64, int(params.shots, 5))), { pickup: params.pickup !== false }); break
-      case 'jump': a = new JumpAction(this); break
-      case 'stop': a = new StopAction(this); break
-      case 'select_slot': a = new SelectSlotAction(this, int(params.slot, 0)); break
-      case 'open_container': { const [x, y, z] = xyz(); const blk = containerBlocked(this, x, y, z); if (blk) throw new Error(blk); a = new ReachThen(this, 'open_container', { x, y, z }, () => new OpenContainerAction(this, x, y, z), this.world.getBlock(x, y, z)?.name ?? '容器'); break }
-      // 按物品名存取 (item 必填, count 缺省=全部, 可带 x,y,z 一步完成); 只给 slot 时走旧的按槽位 shift 点击
-      case 'chest_take': case 'chest_put': {
-        const dir = type === 'chest_take' ? 'take' : 'put'
-        if (params.item) {
-          const at = params.x != null && params.y != null && params.z != null ? { x: int(params.x), y: int(params.y), z: int(params.z) } : undefined
-          a = new ChestTransferAction(this, dir, String(params.item), params.count != null ? Math.max(1, int(params.count)) : undefined, at)
-        } else if (params.slot != null) a = new ChestOpAction(this, dir, int(params.slot))
-        else throw new Error(`${type} 需要 item (物品名), 或旧用法 slot`)
-        break
-      }
-      case 'drop_item': a = new DropItemAction(this, int(params.slot, SLOT.hotbar), !!params.all); break
-      case 'close_window': a = new CloseWindowAction(this); break
-      case 'craft': a = new CraftAction(this, str(params.item, 'item'), int(params.count, 1)); break
-      case 'craft_planks': { // 兼容旧动作: 用背包里第一种原木合成木板
-        const log = this.inventory.find(s => s.name.endsWith('_log') || s.name.endsWith('_stem'))[0]
-        a = new CraftAction(this, log ? log.item.name.replace(/_(log|stem)$/, '_planks') : 'oak_planks', 4); break
-      }
-      case 'smelt': a = new SmeltAction(this, str(params.item, 'item'), int(params.count, 1), params.fuel); break
-      case 'collect': a = new CollectAction(this, str(params.block, 'block'), int(params.count, 1), int(params.radius, 32)); break
-      case 'pickup_items': a = new PickupItemsAction(this, int(params.radius, 8)); break
-      case 'equip': a = new EquipAction(this, str(params.item, 'item')); break
-      case 'eat': a = new EatAction(this, params.item); break
-      case 'use_item': a = new UseItemAction(this, params.item, int(params.hold_ms, 0)); break
-      case 'use_block': a = new UseBlockAction(this, ...xyz(), params.item); break
-      case 'sleep': a = new SleepAction(this, params.x != null ? { x: int(params.x), y: int(params.y), z: int(params.z) } : undefined); break
-      case 'wake': a = new WakeAction(this); break
-      case 'interact_entity': case 'mount': a = new InteractEntityAction(this, int(params.entity_id), params.item); break
-      case 'dismount': a = new DismountAction(this); break
-      case 'trade': a = new TradeAction(this, int(params.entity_id), params.index != null ? int(params.index) : undefined, int(params.times, 1)); break
-      case 'respawn': a = new RespawnAction(this); break
-      case 'go_home': {
-        const h = this.reflex.policy.home
-        if (!h) throw new Error('还没设置 home (set_policy {home: "here"} 或 {home: {x,y,z}})')
-        const hd = homeDimension(h)
-        if (hd !== this.dimension) throw new Error(`home 在 ${hd.replace(/^minecraft:/, '')} (${h.x},${h.y},${h.z}), 你现在在 ${this.dimension.replace(/^minecraft:/, '')}: 坐标不通用, 先找传送门回去`)
-        a = new MoveToAction(this, h, { tolerance: 1, ...moveOpts, maxDistance }); break
-      }
-      case 'script': a = new ScriptAction(this, String(params.code ?? ''), { timeoutMs: params.timeoutMs, args: params.args }); break
-      default: throw new Error(`未知动作类型: ${type}`)
-    }
-    if (a instanceof Task) a.moveOpts = moveOpts
-    return a
+    return buildAction(this, type, params, ctx)
   }
+
+  /** 手动复活动作 (规格表用) */
+  makeRespawn (): Action { return new RespawnAction(this) }
 
   act (type: string, params: any): Action {
     const a = this.makeAction(type, params)
     if (this.dead && type !== 'respawn') { this.track(a); this.lastAction = a; a.fail(`已死亡 (${this.lastDeath?.cause ?? '?'}), 先 act{type:"respawn"} 复活`); return a }
     // 主动作互斥: 新主动作取消旧主动作 (库存类动作不参与互斥)
-    if (!SIDE_ACTIONS.has(type)) {
+    if (!isSideAction(type)) {
       if (this.primaryAction && this.primaryAction.status === 'running') this.primaryAction.cancel(`被新动作 ${type} 取代`)
       this.primaryAction = a
     }
@@ -854,6 +802,22 @@ export class BotAgent {
   /** 下床 */
   stopSleeping () {
     this.client.write('entity_action', { entityId: this.entityId, actionId: 'stop_sleeping', jumpBoost: 0 })
+  }
+
+  /** 附魔台选第 option 个附魔 (0-2) */
+  enchantItem (windowId: number, option: number) {
+    this.client.write('enchant_item', { windowId, enchantment: option })
+  }
+
+  /** 铁砧改名 (输入框内容; 空串 = 恢复默认名) */
+  nameItem (name: string) {
+    this.client.write('name_item', { name })
+  }
+
+  private setGameMode (m: any) {
+    const names = ['survival', 'creative', 'adventure', 'spectator'] as const
+    const v = typeof m === 'number' ? names[m] : names.find(n => n === m)
+    if (v) this.gameMode = v
   }
 
   /** 交易窗口选第 index 项 (服务器自动把付款物品从背包填进付款格) */

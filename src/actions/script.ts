@@ -233,6 +233,7 @@ export class ScriptAction extends AsyncAction {
     // 调用时的同步栈里有脚本帧: 记下行号 (await 之后再抛错就找不到了)
     const line = errorLine(new Error())
     const a = this.bot.makeAction(type, params ?? {}, { script: true })
+    if (a.warning) this.log(`[提醒] ${type}: ${a.warning}`)
     const digName = type === 'dig' ? this.bot.world.getBlock(Math.floor(params.x), Math.floor(params.y), Math.floor(params.z))?.name : undefined
     this.current = `${type} ${JSON.stringify(params ?? {})}`.slice(0, 160)
     try {
@@ -367,8 +368,12 @@ export class ScriptAction extends AsyncAction {
       collect: (block: string, count = 1, radius = 32) => run('collect', { block, count, radius }),
       pickup: (radius = 8) => run('pickup_items', { radius }),
       equip: (item: string) => run('equip', { item }),
+      drop: (item: string, count = 1) => run('drop_item', { item, count }),
       craft: (item: string, count = 1) => run('craft', { item, count }),
       smelt: (item: string, count = 1, fuel?: string) => run('smelt', { item, count, ...(fuel ? { fuel } : {}) }),
+      enchant: (item: string, option?: number) => run('enchant', { item, ...(option != null ? { option } : {}) }),
+      anvil: (item: string, o: { with?: string, rename?: string, slot?: number, withSlot?: number, preview?: boolean } = {}) =>
+        run('anvil', { item, ...(o.with ? { with: o.with } : {}), ...(o.rename !== undefined ? { rename: o.rename } : {}), ...(o.slot != null ? { slot: o.slot } : {}), ...(o.withSlot != null ? { with_slot: o.withSlot } : {}), ...(o.preview ? { preview: true } : {}) }),
       eat: (item?: string) => run('eat', item ? { item } : {}),
       attack: (id: number, hits = 3) => run('attack', { entity_id: id, hits }),
       shoot: (id: number, shots = 5) => run('shoot', { entity_id: id, shots }),

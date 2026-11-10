@@ -1,13 +1,26 @@
 /**
  * 库存与容器跟踪: 玩家背包(窗口0) + 打开中的容器窗口。
- * 26.3 Slot 为组件式格式, 这里只取 itemId/count。
+ * 26.3 Slot 为组件式格式 (只下发与物品默认值不同的组件): 这里取 itemId/count + 附魔/耐久/自定义名/铁砧累计花费。
  */
 import { mcData } from '../version.js'
+
+export interface Enchant { name: string, level: number }
 
 export interface ItemStack {
   itemId: number
   name: string
   count: number
+  /** 物品身上的附魔 */
+  enchantments?: Enchant[]
+  /** 附魔书里存的附魔 (enchanted_book) */
+  stored?: Enchant[]
+  /** 已损耗耐久 / 最大耐久 (有耐久的物品才有) */
+  damage?: number
+  maxDamage?: number
+  /** 改过的名字 (铁砧) */
+  customName?: string
+  /** 铁砧累计惩罚 (每过一次铁砧翻倍) */
+  repairCost?: number
 }
 
 export interface OpenWindow {
@@ -15,7 +28,32 @@ export interface OpenWindow {
   type: number
   title: string
   slots: (ItemStack | null)[]
+  /** 窗口属性 (craft_progress_bar): 附魔台 0-2 等级要求/4-6 附魔提示/7-9 提示等级; 铁砧 0 = 花费等级 */
+  props: Record<number, number>
 }
+
+// 附魔是动态注册表: 优先用服务器 registry_data 下发的顺序, 缺了按 minecraft-data 兜底
+let enchantNames: string[] = []
+export function setEnchantmentNames (names: string[]) { enchantNames = names }
+export function enchantName (id: number): string {
+  return enchantNames[id] ?? mcData.enchantmentsArray?.find((e: any) => e.id === id)?.name ?? `enchantment_${id}`
+}
+
+/** NBT 文本组件 → 纯文本 (自定义名之类) */
+function nbtText (n: any): string {
+  if (n == null) return ''
+  if (typeof n !== 'object') return String(n)
+  if (n.type === 'string') return String(n.value)
+  if (n.type === 'compound') {
+    const v = n.value ?? {}
+    const extra = v.extra?.value?.value ?? []
+    return nbtText(v.text ?? v[''] ?? v.translate) + extra.map((e: any) => nbtText(typeof e === 'object' && !e.type ? { type: 'compound', value: e } : e)).join('')
+  }
+  if (typeof n.value === 'string') return n.value
+  return ''
+}
+
+const enchList = (d: any): Enchant[] => (d?.enchantments ?? []).map((e: any) => ({ name: enchantName(e.id), level: e.level }))
 
 const itemNameById: Map<number, string> = (() => {
   const m = new Map<number, string>()
@@ -27,11 +65,43 @@ const itemNameById: Map<number, string> = (() => {
 
 export function parseSlot (s: any): ItemStack | null {
   if (!s || typeof s !== 'object' || !s.itemId) return null
-  return {
+  const it: ItemStack = {
     itemId: s.itemId,
     name: itemNameById.get(s.itemId) ?? `item_${s.itemId}`,
     count: s.itemCount ?? 1,
   }
+  const maxDur = mcData.items[s.itemId]?.maxDurability
+  if (maxDur) { it.damage = 0; it.maxDamage = maxDur }
+  for (const c of s.components ?? []) {
+    try {
+      if (c.type === 'enchantments') { const l = enchList(c.data); if (l.length) it.enchantments = l }
+      else if (c.type === 'stored_enchantments') it.stored = enchList(c.data)
+      else if (c.type === 'damage') it.damage = Number(c.data)
+      else if (c.type === 'max_damage') it.maxDamage = Number(c.data)
+      else if (c.type === 'custom_name') it.customName = nbtText(c.data)
+      else if (c.type === 'repair_cost') it.repairCost = Number(c.data)
+    } catch {}
+  }
+  return it
+}
+
+/** 物品一行描述: iron_sword「Bob」 [sharpness 3, unbreaking 2] 耐久 200/250 */
+export function describeItem (it: ItemStack | null | undefined): string {
+  if (!it) return '空'
+  const ench = (l?: Enchant[]) => l?.length ? ` [${l.map(e => `${e.name} ${e.level}`).join(', ')}]` : ''
+  return `${it.name}${it.count > 1 ? `×${it.count}` : ''}${it.customName ? `「${it.customName}」` : ''}${ench(it.enchantments)}${ench(it.stored)}` +
+    (it.maxDamage ? ` 耐久 ${it.maxDamage - (it.damage ?? 0)}/${it.maxDamage}` : '')
+}
+
+/** 物品的附加信息 (给 list_inventory / get_container 输出; 没有则为空对象) */
+export function itemExtras (it: ItemStack): Record<string, any> {
+  const o: Record<string, any> = {}
+  if (it.enchantments?.length) o.enchantments = it.enchantments.map(e => `${e.name} ${e.level}`)
+  if (it.stored?.length) o.stored_enchantments = it.stored.map(e => `${e.name} ${e.level}`)
+  if (it.maxDamage) o.durability = `${it.maxDamage - (it.damage ?? 0)}/${it.maxDamage}`
+  if (it.customName) o.custom_name = it.customName
+  if (it.repairCost) o.repair_cost = it.repairCost
+  return o
 }
 
 /**
@@ -132,8 +202,14 @@ export class Inventory {
   handleSetCursor (p: any) { this.cursor = parseSlot(p.contents) }
 
   handleOpenWindow (p: any) {
-    this.windows.set(p.windowId, { windowId: p.windowId, type: p.inventoryType, title: '', slots: [] })
+    this.windows.set(p.windowId, { windowId: p.windowId, type: p.inventoryType, title: '', slots: [], props: {} })
     this.activeWindowId = p.windowId
+  }
+
+  /** 窗口属性 (craft_progress_bar): 附魔台选项 / 铁砧花费 / 熔炉进度 */
+  handleWindowProperty (p: any) {
+    const w = this.windows.get(p.windowId)
+    if (w) w.props[p.property] = p.value
   }
 
   close (windowId: number) {
@@ -147,10 +223,10 @@ export class Inventory {
   }
 
   /** 简要列表: 非空槽位 */
-  list (): { slot: number, name: string, count: number }[] {
+  list (): { slot: number, name: string, count: number, [k: string]: any }[] {
     const out: { slot: number, name: string, count: number }[] = []
     this.slots.forEach((s, i) => {
-      if (s) out.push({ slot: i, name: s.name, count: s.count })
+      if (s) out.push({ slot: i, name: s.name, count: s.count, ...itemExtras(s) })
     })
     return out
   }

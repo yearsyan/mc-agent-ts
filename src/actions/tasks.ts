@@ -10,7 +10,7 @@ import { standableCell } from './astar.js'
 import { holdSlot, holdItem, holdNothing, closeContainer, faceTowards, canReach, canSee, boxDist, eyeOf, REACH } from './hands.js'
 import type { Action } from './base.js'
 import { SLOT, PLAYER_STORAGE, SWAP_OFFHAND_BUTTON, containerSize, toWindowSlot } from '../conn/inventory.js'
-import { mcData, itemName, itemId, foodScore, fuelTicks, blockProps, bestToolFor, harvestToolNames } from '../game/knowledge.js'
+import { mcData, itemName, itemId, foodScore, fuelTicks, blockProps, bestToolFor, harvestToolNames, isNaturalBlock } from '../game/knowledge.js'
 
 const AIRISH = new Set(['air', 'cave_air', 'void_air'])
 const BED_COLORS = ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray', 'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black']
@@ -168,10 +168,12 @@ export abstract class Task extends AsyncAction {
   fail (detail = '') { if (this.status === 'running') super.fail(this.settle(detail)) }
   cancel (reason = '') { if (this.status === 'running') super.cancel(this.settle(reason)) }
 
-  /** 找到/走到/放置一个工作方块 (工作台/熔炉), 返回其坐标 */
-  protected async ensureStation (block: string, label: string): Promise<{ x: number, y: number, z: number }> {
+  /** 找到/走到/放置一个工作方块 (工作台/熔炉/附魔台/铁砧; 可给多个方块名, 放置用第一个背包里有的), 返回其坐标 */
+  protected async ensureStation (blocks: string | string[], label: string): Promise<{ x: number, y: number, z: number }> {
     const bot = this.bot
-    const near = bot.world.findBlock(block, Math.floor(bot.pos.x), Math.floor(bot.pos.z), 32, 5, Math.floor(bot.pos.y))
+    const names = Array.isArray(blocks) ? blocks : [blocks]
+    const d = (b: { x: number, y: number, z: number }) => Math.hypot(b.x + 0.5 - bot.pos.x, b.y - bot.pos.y, b.z + 0.5 - bot.pos.z)
+    const near = names.flatMap(n => bot.world.findBlock(n, Math.floor(bot.pos.x), Math.floor(bot.pos.z), 32, 5, Math.floor(bot.pos.y))).sort((a, b) => d(a) - d(b))
     const inReach = near.find(b => canReach(bot, b.x, b.y, b.z) && canSee(bot.world, eyeOf(bot), b.x, b.y, b.z))
     if (inReach) return inReach
     if (near.length) {
@@ -179,7 +181,8 @@ export abstract class Task extends AsyncAction {
       await reachBlock(this, bot, t.x, t.y, t.z, label)
       return t
     }
-    if (!bot.inventory.count(block)) throw new Error(`需要${label}: 32 格内没有, 背包里也没有 ${block}`)
+    const block = names.find(n => bot.inventory.count(n) > 0)
+    if (!block) throw new Error(`需要${label}: 32 格内没有, 背包里也没有 ${names[0]}`)
     // 就地放一个: 选身边一个空格 (脚下实心, 不是自己站的格)
     const bx = Math.floor(bot.pos.x), by = Math.floor(bot.pos.y), bz = Math.floor(bot.pos.z)
     for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
@@ -233,6 +236,27 @@ export abstract class Task extends AsyncAction {
       await this.until(() => (this.winSlot(wid, target)?.count ?? 0) >= before + k, 2000, `${name} 放入`)
       placed += k
     }
+  }
+
+  /**
+   * 把玩家槽 src (9-45) 里的 n 个放进窗口 wid 的 target 格 (n 缺省 = 整组)。
+   * 用于必须指定"哪一件"的场合 (附魔/铁砧: 同名工具可能有好几把)。
+   */
+  protected async putFrom (wid: number, toWin: (s: number) => number, src: number, target: number, n?: number) {
+    const bot = this.bot
+    const it = bot.inventory.slots[src]
+    if (!it) throw new Error(`槽位 ${src} 是空的`)
+    const k = Math.min(n ?? it.count, it.count)
+    const before = this.winSlot(wid, target)?.count ?? 0
+    bot.clickSlot(wid, toWin(src), 0, 0) // 拿起整组
+    if (k === it.count) bot.clickSlot(wid, target, 0, 0)
+    else {
+      for (let i = 0; i < k; i++) bot.clickSlot(wid, target, 1, 0) // 右键放 1 个
+      bot.clickSlot(wid, toWin(src), 0, 0) // 剩余放回原格
+    }
+    await this.until(() => (this.winSlot(wid, target)?.count ?? 0) > before, 2000, `${it.name} 放入`)
+    await this.sleep(150)
+    if (bot.inventory.cursor) await this.stowCursor(wid, toWin) // 目标格放不下的 (如附魔台只收 1 个) 放回背包
   }
 
   /** 把光标上的物品放回背包 (同类可合并的堆优先, 否则空格) */
@@ -393,13 +417,25 @@ export class SmeltAction extends Task {
 
 // ---------- 拾取掉落物 ----------
 
+/** 走不到的掉落物说明 (pickup_items / collect 共用) */
+function unreachableText (items: { name: string, x: number, y: number, z: number }[]): string {
+  const shown = items.slice(0, 4).map(i => `${i.name} @ (${i.x},${i.y},${i.z})`).join(', ')
+  return `${items.length} 个掉落物走不到、没捡起来: ${shown}${items.length > 4 ? ' …' : ''} (掉在矮洞里或被方块挡着; 加 allow_dig:true 重新下达可以挖开去捡)`
+}
+
 export class PickupItemsAction extends Task {
   constructor (bot: BotAgent, private radius = 8, private center?: { x: number, y: number, z: number }, private maxMs = 30_000) { super(bot, 'pickup_items') }
+
+  /** 范围内走不到、没捡起来的掉落物 (结束时还在的) */
+  unreachable: { name: string, x: number, y: number, z: number }[] = []
+  /** 背包满了没捡的掉落物个数 */
+  noRoom = 0
 
   protected async run () {
     const bot = this.bot
     const c = () => this.center ?? bot.pos
     const skip = new Set<number>()
+    const noRoom = new Set<number>() // 背包满了装不下的
     const misses = new Map<number, number>() // 刚掉落的物品还在弹跳, 允许按最新位置重试几次
     const miss = (id: number) => { const n = (misses.get(id) ?? 0) + 1; misses.set(id, n); if (n >= 3) skip.add(id) }
     const t0 = Date.now(), picked0 = bot.pickedUp
@@ -407,14 +443,31 @@ export class PickupItemsAction extends Task {
       if (Date.now() - t0 > this.maxMs) break
       const items = [...bot.world.entities.values()]
         // 掉落物 + 自己射出、插在地上的箭
-        .filter(e => (e.type === 'item' || (/^(arrow|spectral_arrow)$/.test(e.type) && e.ownerId === bot.entityId && e.meta.in_ground)) && !skip.has(e.id) && Math.hypot(e.x - c().x, e.z - c().z) <= this.radius && Math.abs(e.y - c().y) <= 6)
+        .filter(e => (e.type === 'item' || (/^(arrow|spectral_arrow)$/.test(e.type) && e.ownerId === bot.entityId && e.meta.in_ground)) && !skip.has(e.id) && !noRoom.has(e.id) && Math.hypot(e.x - c().x, e.z - c().z) <= this.radius && Math.abs(e.y - c().y) <= 6)
         .sort((a, b) => Math.hypot(a.x - bot.pos.x, a.z - bot.pos.z) - Math.hypot(b.x - bot.pos.x, b.z - bot.pos.z))
       if (!items.length) break
       const e = items[0]
       const itemName = e.type === 'item' ? e.item : 'arrow'
-      if (bot.inventory.emptySlots() === 0 && !bot.inventory.find(s => s.name === itemName && s.count < 64).length) { skip.add(e.id); continue }
+      if (bot.inventory.emptySlots() === 0 && !bot.inventory.find(s => s.name === itemName && s.count < 64).length) { noRoom.add(e.id); continue }
       // 还在半空往下掉 (如高处挖下来的原木): 等它落地再走, 免得朝空中走失败几次就放弃
       if (!standableCell(bot.world, Math.floor(e.x), Math.floor(e.y + 0.2), Math.floor(e.z)) && Date.now() - t0 < 3000) { await this.sleep(150); continue }
+      // 就在脚边 (常见: 挖了自己脚下那一列, 人还搭在坑沿上, 掉落物在正下方): 寻路的起点和终点是同一列, 规划不出来, 直接朝它走两步
+      if (Math.hypot(e.x - bot.pos.x, e.z - bot.pos.z) < 1.3 && e.y < bot.pos.y + 0.5 && e.y > bot.pos.y - 3) {
+        const ctl = bot.physics.control
+        const t1 = Date.now()
+        try {
+          while (bot.world.entities.has(e.id) && Date.now() - t1 < 1200) {
+            const cur = bot.world.entities.get(e.id)!
+            if (Math.hypot(cur.x - bot.pos.x, cur.z - bot.pos.z) < 0.15) break
+            faceTowards(bot, cur.x, bot.pos.y + bot.eyeHeight, cur.z)
+            ctl.forward = true
+            await this.sleep(50)
+          }
+        } finally { ctl.forward = false }
+        const t2 = Date.now()
+        while (bot.world.entities.has(e.id) && Date.now() - t2 < 500) await this.sleep(100)
+        if (!bot.world.entities.has(e.id)) continue
+      }
       const mv = await this.subMove({ x: e.x, y: Math.floor(e.y + 0.2), z: e.z }, { tolerance: 0, timeoutMs: 15_000 })
       if (mv.status !== 'done') { miss(e.id); continue }
       // 走到了: 等一下拾取; 还在就记一次未命中
@@ -423,7 +476,17 @@ export class PickupItemsAction extends Task {
       if (bot.world.entities.has(e.id)) miss(e.id)
     }
     const n = bot.pickedUp - picked0
-    return n ? `捡起 ${n} 个物品` : '附近没有可捡的掉落物'
+    // 试过但走不到的 (掉进矮洞/被方块挡住的坑里): 如实说出来, 不要报成"附近没有"
+    for (const id of skip) {
+      const e = bot.world.entities.get(id)
+      if (e) this.unreachable.push({ name: e.type === 'item' ? (e.item ?? 'item') : 'arrow', x: Math.floor(e.x), y: Math.floor(e.y + 0.2), z: Math.floor(e.z) })
+    }
+    const notes = [
+      ...(this.unreachable.length ? [unreachableText(this.unreachable)] : []),
+      ...(noRoom.size ? [`背包满了, ${noRoom.size} 个掉落物装不下`] : []),
+    ]
+    this.noRoom = noRoom.size
+    return n ? `捡起 ${n} 个物品${notes.length ? '; 另有 ' + notes.join('; ') : ''}` : notes.join('; ') || '附近没有可捡的掉落物'
   }
 }
 
@@ -443,16 +506,65 @@ export class CollectAction extends Task {
     }
     const before = bot.inventory.summary()
     const failed = new Set<string>()
-    let mined = 0, lastErr = ''
+    const lost: { name: string, x: number, y: number, z: number }[] = []
+    let mined = 0, lastErr = '', noRoom = 0
+    type P = { x: number, y: number, z: number }
+    // 挖掉以后那一格走得出来: 四周有同层或高一层的落脚点 (否则是个两格深的坑, 下去就跳不出来)
+    const exitable = (h: P) => [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dz]) => standableCell(bot.world, h.x + dx, h.y, h.z + dz) || standableCell(bot.world, h.x + dx, h.y + 1, h.z + dz))
+    // 挖掉以后人走得进去捡、也走得出来: 上面两格是空的 (不是埋在别的方块下面), 下面有地面。埋着的方块挖出来是个矮洞, 掉落物拿不到
+    const retrievable = (h: P) => !bot.world.isSolid(h.x, h.y + 1, h.z) && !bot.world.isSolid(h.x, h.y + 2, h.z) && bot.world.isSolid(h.x, h.y - 1, h.z) && exitable(h)
+    // 目标只被正上方一块自然方块盖着 (如草方块下面的泥土), 且那块挖得快 (≤3s): 先把它挖开, 掉落物就不会封在洞里。
+    // 只限这一种情况: 人造方块、盖了两层以上、挖得慢的都不动, 照旧如实报告掉落物拿不到
+    const coverOf = (h: P): string | null => {
+      if (!bot.world.isSolid(h.x, h.y + 1, h.z) || bot.world.isSolid(h.x, h.y + 2, h.z) || !bot.world.isSolid(h.x, h.y - 1, h.z)) return null
+      const name = bot.world.getBlock(h.x, h.y + 1, h.z)?.name
+      if (!name || !isNaturalBlock(name)) return null
+      return bestToolFor(name, toolCandidates(bot)).ticks / 20 <= 3 ? name : null
+    }
+    let opened = 0, pillared = 0
+    const cellOf = () => ({ x: Math.floor(bot.pos.x), y: Math.floor(bot.pos.y + 0.01), z: Math.floor(bot.pos.z) })
+    const home = cellOf() // 开工时站的位置
+    /** 回到 to 那一层: 目标取那一层上还站得住的格 (to 本身可能就是被挖掉的那一列); 只走现成的路回不去, 才在脚下垫方块爬出来 */
+    const climbBack = async (to: P) => {
+      const spots: (P & { d: number })[] = []
+      for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) {
+        if (standableCell(bot.world, to.x + dx, to.y, to.z + dz)) spots.push({ x: to.x + dx, y: to.y, z: to.z + dz, d: Math.hypot(to.x + dx + 0.5 - bot.pos.x, to.z + dz + 0.5 - bot.pos.z) })
+      }
+      const spot = spots.sort((a, b) => a.d - b.d)[0]
+      if (!spot) return
+      await this.subMove(spot, { tolerance: 0, timeoutMs: 10_000 })
+      if (bot.pos.y >= to.y - 1.2) return
+      const n0 = this.route.placed.length
+      await this.subMove(spot, { tolerance: 0, allowPlace: true, timeoutMs: 15_000 })
+      pillared += this.route.placed.length - n0
+    }
     while (mined < this.count) {
       this.check()
       const hits = bot.world.findBlock(this.block, Math.floor(bot.pos.x), Math.floor(bot.pos.z), this.radius, 48, Math.floor(bot.pos.y))
         .filter(h => !failed.has(`${h.x},${h.y},${h.z}`))
+        // 自己垫脚放的方块不算 (不然刚垫上爬出坑, 转头又把它挖掉掉回去)
+        .filter(h => !this.route.placed.some(e => e.pos[0] === h.x && e.pos[1] === h.y && e.pos[2] === h.z))
       if (!hits.length) break
-      // 优先已经够得着的, 其次有暴露面的 (不用挖进去), 最后最近的
-      const t = hits.find(h => canReach(bot, h.x, h.y, h.z) && canSee(bot.world, eyeOf(bot), h.x, h.y, h.z)) ?? hits.find(h => exposed(bot, h.x, h.y, h.z)) ?? hits[0]
+      // 优先已经够得着的, 其次有暴露面的 (不用挖进去), 最后最近的; 每一档里先挑挖完能走进去捡掉落物的
+      // 再其次是挖开上方一块自然方块就能捡的 (coverOf); 都不是的 (深埋/坑底) 排最后
+      const near = (h: P) => canReach(bot, h.x, h.y, h.z) && canSee(bot.world, eyeOf(bot), h.x, h.y, h.z)
+      const open = (h: P) => exposed(bot, h.x, h.y, h.z)
+      // 自己正踩着的那几列先不挖: 挖空了人可能还搭在坑沿上没掉下去, 掉落物在正下方反而走不过去
+      const underFeet = (h: P) => h.y < bot.pos.y && Math.abs(h.x + 0.5 - bot.pos.x) < 0.8 && Math.abs(h.z + 0.5 - bot.pos.z) < 0.8
+      const t = hits.find(h => near(h) && retrievable(h)) ?? hits.find(h => open(h) && retrievable(h)) ??
+        hits.find(h => near(h) && !underFeet(h) && coverOf(h)) ?? hits.find(h => Math.abs(h.y - bot.pos.y) <= 6 && !underFeet(h) && coverOf(h)) ??
+        hits.find(near) ?? hits.find(open) ?? hits[0]
       const k = `${t.x},${t.y},${t.z}`
+      // 动手前站的位置 (挖的可能就是自己脚下那一列, 挖完人已经掉下去了)
+      const back = cellOf()
       try {
+        const cover = retrievable(t) ? null : coverOf(t)
+        if (cover) {
+          await reachBlock(this, bot, t.x, t.y + 1, t.z, cover)
+          await this.must(new DigAction(bot, t.x, t.y + 1, t.z), `挖开上方的 ${cover}`)
+          this.route.add('dug', cover, t.x, t.y + 1, t.z)
+          opened++
+        }
         await reachBlock(this, bot, t.x, t.y, t.z, this.block)
         await this.must(new DigAction(bot, t.x, t.y, t.z), '挖掘')
       } catch (e: any) {
@@ -463,12 +575,20 @@ export class CollectAction extends Task {
       }
       mined++
       await this.sleep(600) // 等掉落物生成并落地
-      await this.sub(new PickupItemsAction(bot, 4, { x: t.x + 0.5, y: t.y, z: t.z + 0.5 }, 8000))
+      const pick = await this.sub(new PickupItemsAction(bot, 4, { x: t.x + 0.5, y: t.y, z: t.z + 0.5 }, 8000))
+      noRoom = Math.max(noRoom, pick.noRoom)
+      for (const u of pick.unreachable) if (!lost.some(l => l.x === u.x && l.y === u.y && l.z === u.z && l.name === u.name)) lost.push(u)
+      // 下去捡完发现在一个两格深的坑里跳不出来 (平地上挖开草方块再挖泥土就是这样): 走回刚才那一层, 走不了就在脚下垫一块爬出来。
+      // 每个目标挖完都保证人在坑外, 不把自己困住
+      if (bot.pos.y < back.y - 1.2) await climbBack(back)
     }
+    // 收工前再查一次: 连着挖几块, 人可能一格一格陷进自己挖的坑里 (每次只低一格, 上面那条查不出来)。
+    // 比开工时低了一格多、又没走远, 就回到开工那一层 (走得回去就走, 走不回去垫一块)
+    if (bot.pos.y < home.y - 1.2 && Math.hypot(bot.pos.x - home.x, bot.pos.z - home.z) <= 16) await climbBack(home)
     const after = bot.inventory.summary()
     const gained = Object.entries(after).map(([n, c]) => [n, c - (before[n] ?? 0)] as const).filter(([, d]) => d > 0).map(([n, d]) => `${n}+${d}`)
     if (!mined) throw new Error(`没采到 ${this.block}${lastErr ? `: ${lastErr}` : ` (${this.radius} 格内没找到)`}`)
-    return `挖了 ${mined}/${this.count} 个 ${this.block}; 背包新增: ${gained.join(', ') || '无 (可能工具不对)'}${mined < this.count ? `; 没挖够的原因: ${lastErr || `${this.radius} 格内没有更多了`}` : ''}`
+    return `挖了 ${mined}/${this.count} 个 ${this.block}; 背包新增: ${gained.join(', ') || '无'}${opened ? `; 目标埋在自然方块下面, 先挖开了上方 ${opened} 块好捡掉落物${pillared ? `, 捡完垫了 ${pillared} 块爬出坑` : ''}` : ''}${lost.length ? `; ${unreachableText(lost)}${this.block === 'dirt' ? '。地表的 grass_block 挖了也掉 dirt, 而且掉在露天好捡: 可以改成 collect grass_block' : ''}` : ''}${noRoom ? `; 背包满了, ${noRoom} 个掉落物装不下` : ''}${!gained.length && !lost.length && !noRoom ? ' (没看到掉落物: 可能掉到够不着的地方了)' : ''}${mined < this.count ? `; 没挖够的原因: ${lastErr || `${this.radius} 格内没有更多了`}` : ''}`
   }
 }
 

@@ -6,13 +6,13 @@
 
 | 工具 | 说明 |
 |---|---|
-| `get_scene` / `get_view` / `get_map` | 场景 JSON（位置/血量/背包/附近实体/反射状态/死亡信息）· 第一人称 PNG · 顶视地图 PNG（两张图都附文字说明，见下） |
-| `say` / `read_chat` | 发言（不执行命令）· 读聊天（按类型渲染 `* A 挥手`、`A 悄悄对你说: …`，带 key/self，seq 增量） |
+| `get_scene` / `get_view` / `get_map` | 场景 JSON（紧凑输出：位置/血量/经验等级/`action` 当前主动作/背包/附近实体/反射状态 state+home+最近事件/死亡信息；完整策略用不带参数的 `set_policy` 看）· 第一人称 PNG · 顶视地图 PNG（两张图都附文字说明，见下） |
+| `say` / `read_chat` | 发言（不执行命令）· 读聊天（按类型渲染 `* A 挥手`、`A 悄悄对你说: …`，带 key/self；默认只给上次读过之后的新消息，最多 `limit` 条（默认 50，最大 200），`since` 可重看旧消息） |
 | `run_command` | 以角色身份执行服务器命令。**权限完全由服务器决定**，结果区分「无权限」（附可用命令列表）与「参数错误」 |
-| `act` / `wait_action` / `wait_event` | 异步动作（见下）· 等动作完成（新消息可中断，动作不中止）· 空闲长轮询等消息（≤180s，比轮询 read_chat 省调用） |
+| `act` / `wait_action` / `wait_event` | 异步动作（见下；带 `wait_ms` 在时限内等到结束直接返回结果，省一次 `wait_action`）· 等动作完成（新消息可中断，动作不中止）· 空闲长轮询等消息（≤180s，比轮询 read_chat 省调用） |
 | `set_policy` | 反射策略（见下） |
 | `run_script` / `script_status` / `stop_script` | 脚本动作（见下）· 运行中进度/新日志 · 中止（连同正在执行的子动作） |
-| `get_block` / `find_block` / `list_inventory` / `get_container` | 方块查询（含 `props` 状态属性：作物 age、门 open、熔炉 lit…）· 找方块 · 库存（每格标注快捷栏/背包/盔甲/副手，附手持物与汇总）· 当前容器（容器格与背包分开，带方块名/坐标/空格数/汇总） |
+| `get_block` / `find_block` / `list_inventory` / `get_container` | 方块查询（含 `props` 状态属性：作物 age、门 open、熔炉 lit…）· 找方块 · 库存（每格标注快捷栏/背包/盔甲/副手，附手持物与汇总；附魔/附魔书内容/耐久/自定义名/铁砧惩罚）· 当前容器（容器格与背包分开，带方块名/坐标/空格数/汇总） |
 | `spawn_agent` / `kill_agent` / `list_agents` | 生命周期（admin；agent 的 kill_agent = 自己下线歇会儿） |
 
 **视觉**：图负责空间关系，随图附的文字给精确数字。
@@ -22,17 +22,26 @@
 
 **消息收件箱**：别人的聊天/私聊 + 自己死亡会主动推给 agent——任何工具返回末尾附 `{inbox:{unread, latest, hint}}`；`wait_event` 挂起等待、`wait_action` 立即中断送达（~200ms）；`read_chat` 读过即消。
 
-### act 动作（异步，返回 actionId；死亡时全部取消，detail 给死因）
+### act 动作（异步，返回 actionId；`wait_ms` 内联等待；死亡时全部取消，detail 给死因）
+
+动作的参数、用法、一句说明都定义在**动作规格表** `src/actions/registry.ts`：`act` 工具的描述 / `type` 枚举 / 参数 schema、参数校验、是否参与主动作互斥都由它生成，加动作或改参数只改那一处。下表是给人看的详细说明，`pnpm check:actions` 核对它有没有漏动作。
+- **参数校验**：缺参数、类型不对时直接报错，写明是哪个参数并附该动作的用法（`dig 缺少参数 y; 用法: dig{x,y,z}`）；数值超范围按边界截断。动作名写错会提示最像的那个。
+- **驼峰写法照收**：`allowDig` / `entityId` / `maxDist` 当成 `allow_dig` / `entity_id` / `max_dist`（脚本 API 是驼峰，两套写法混用不出错）。
+- **没认出来的参数**不拒绝，动作照常执行，结果里加 `warning` 列出没用上的参数和最像的正确名字。
+- **旧用法**（`mount`、`craft_planks`、`chest_take{slot}`、只给 `slot` 的 `drop_item`）仍然接受，但不出现在枚举和描述里。
+- 寻路走不通、结果带 `proposals` 时附 `hint` 说明怎么确认；这段细则不放在工具描述里。
 
 | 类别 | 动作 |
 |---|---|
 | 移动 | `move_to{x,z,y?,tolerance?,max_dist?,confirm?,allow_dig?,allow_place?}`（单次最多走 `max_dist` 格，默认 128；自动开门/爬梯/游泳, 远距离分段；连续深水 ≥6 格自动冲刺游泳；有水桶时 5~32 格高处直接跳下用落地水缓冲；挖穿/垫高/搭桥需确认，见下）· `go_home` · `jump` · `stop` |
-| 采集 | `collect{block,count?,radius?}`（先检查工具：挖了不会掉落的直接失败并说明至少要什么工具；找→走→最佳工具挖→等掉落物落地再捡）· `dig{x,y,z}`（自动走近、自动换工具）· `pickup_items` |
+| 采集 | `collect{block,count?,radius?}`（先检查工具：挖了不会掉落的直接失败并说明至少要什么工具；找→走→最佳工具挖→等掉落物落地再捡；优先挑挖完能走进去捡、也走得出来的方块（上面两格是空的）；目标只被正上方**一块自然方块**盖着且挖得快（≤3s，如草方块下的泥土）时先把它挖开再挖目标，人造方块/盖了两层以上的不动；下去捡完若陷在两格深的坑里，先试走回原来那一层，走不回去就在脚下垫一块爬出来，挖开和垫的方块都记进 `route`；仍走不到的掉落物在结果里写明位置，加 `allow_dig` 可挖开去捡；背包满了装不下也会说明）· `dig{x,y,z}`（自动走近、自动换工具）· `pickup_items`（走不到的掉落物列出位置，背包满了装不下也说明，不再报成"附近没有"）|
 | 建造/合成 | `place{x,y,z,item?}` · `craft{item,count?}`（3×3 自动找放工作台）· `smelt{item,count?,fuel?}`（自动找放熔炉/选燃料） |
-| 物品 | `equip{item}`（工具/盔甲/盾）· `eat` · `use_item` · `select_slot` · `drop_item` |
-| 交互 | `use_block` · `sleep`/`wake` · `interact_entity{entity_id,item?}`（喂食/剪毛/骑乘）· `mount`/`dismount` · `trade{entity_id,index?,times?}` |
+| 附魔 | `enchant{item,option?,slot?}`：自动找/放附魔台、放青金石；不给 `option` 只返回三个选项（等级要求、花费 N 级+N 青金石、提示附魔、不可选原因、书架数），选好再带 `option` 0~2 执行并取出；默认挑没附过魔的那件 |
+| 铁砧 | `anvil{item,with?,rename?,slot?,with_slot?,preview?}`：合并附魔书/同类物品修耐久/材料修复/改名（`rename:""` 去名）；先读花费，等级不够或 ≥40 级"过于昂贵"直接说明，`preview` 只看产物和花费；会把物品原有自定义名发回服务器，合并时不会丢名字；用坏铁砧会注明 |
+| 物品 | `equip{item}`（工具/盔甲/盾）· `eat` · `use_item` · `select_slot` · `drop_item{item,count?,all?,slot?}`（按物品名丢，`count` 缺省 1，`all` 全丢可跨多组，先丢背包里的再丢快捷栏的；`slot` 只在同名多件时指定丢哪一格，并核对那格确实是 `item`，不是就报错不丢；什么都不传报错）|
+| 交互 | `use_block` · `sleep`/`wake` · `interact_entity{entity_id,item?}`（喂食/剪毛/骑乘）· `dismount` · `trade{entity_id,index?,times?}` |
 | 战斗 | `attack{entity_id,hits?}`（自动换武器；够不着或隔墙看不见会追过去，每次靠近一小段再判断；挥砍间隔按武器攻速：剑 0.63s、斧 1~1.25s；LLM 在近战/射击时反射层不抢着砍）· `shoot{entity_id,shots?,pickup?}`（弓箭自动瞄准：弹道解算+移动预判，隔墙/会误伤村民玩家时不射，贴脸改近战，打完捡回箭） |
-| 容器 | `chest_take{item,count?,x?,y?,z?}` · `chest_put{item,count?,x?,y?,z?}`（按物品名存取，count 缺省为全部；带坐标就一步完成：走过去→开箱→存取→关箱；每步核对数量，满了停下并说明，返回 `moved/in_container/in_inventory`；旧的 `{slot}` 用法保留）· `open_container`（箱子上方被完整方块挡住或有猫坐着时直接说明原因）· `close_window` |
+| 容器 | `chest_take{item,count?,x?,y?,z?}` · `chest_put{item,count?,x?,y?,z?}`（按物品名存取，count 缺省为全部；带坐标就一步完成：走过去→开箱→存取→关箱；每步核对数量，满了停下并说明，返回 `moved/in_container/in_inventory`）· `open_container`（箱子上方被完整方块挡住或有猫坐着时直接说明原因）· `close_window` |
 | 死亡 | `respawn`（仅 autoRespawn=false 时需要） |
 
 **改地形需确认**：寻路默认只走现成的路（开门/爬梯/游泳），不挖不搭。
@@ -111,7 +120,7 @@ LLM 决策要数秒，保命行为由 bot 每 tick 自主执行，打断主动�
 
 - `src/version.ts` — 游戏版本单一来源：`MC_VERSION`/协议号 + `mcData`/`Block`/`Chunk` 单例（其他模块不自己 require minecraft-data）
 - `src/conn/` — bot.ts（连接/tick/动作/聊天/死亡；**所有发包都在这里**）、reflex.ts（反射层）、inventory.ts（库存 + 槽位布局常量 `SLOT`）
-- `src/actions/` — base.ts（Action/AsyncAction 框架）、actions.ts（移动/挖掘/容器）、tasks.ts（采集/合成/交互/交易）、combat.ts（远程战斗：弹道+瞄准）、script.ts（run_script 脚本引擎）、hands.ts（手持/背包操作）、astar.ts
+- `src/actions/` — base.ts（Action/AsyncAction 框架）、registry.ts（动作规格表：参数校验 + act 工具描述/schema 的来源）、actions.ts（移动/挖掘/容器）、tasks.ts（采集/合成/交互/交易）、combat.ts（远程战斗：弹道+瞄准）、script.ts（run_script 脚本引擎）、hands.ts（手持/背包操作）、astar.ts
 - `src/world/` `src/physics/` `src/vision/` `src/game/` — 世界模型 · 物理适配 · raycast 渲染 · 物品/方块知识（knowledge.ts）+ 弹道（ballistics.ts）
 - `src/http/` — serve.ts（MCP+REST+WebUI 单服务、工具注册与角色过滤）、tokens.ts、oplog.ts、webui.html
 - `third_party/` — 26.2/26.3 协议数据（minecraft-data PR #1301, MIT, 见 NOTICE.md）· `scripts/setup-overlay.ts` 可重现 patch

@@ -13,6 +13,8 @@ export abstract class Action {
   detail = ''
   /** 结构化附加结果, 随 wait_action 一起返回 (如寻路的 route 改动记录 / proposals 挖搭方案) */
   extra?: Record<string, unknown>
+  /** 参数上的提醒 (如没认出来的参数名), 随结果一起返回; 不影响执行 */
+  warning?: string
   readonly createdAt = Date.now()
   /** 状态离开 running 时回调一次 (操作日志用) */
   onSettle?: (a: Action) => void

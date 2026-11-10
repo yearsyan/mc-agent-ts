@@ -455,6 +455,6 @@ export class Reflex {
   }
 
   status () {
-    return { state: this.state, ...(this.shieldUp ? { shield_up: true } : {}), policy: this.policy, recent: this.events.slice(-5).map(e => ({ ago_s: Math.round((Date.now() - e.at) / 1000), text: e.text })) }
+    return { state: this.state, ...(this.shieldUp ? { shield_up: true } : {}), home: this.policy.home ?? null, recent: this.events.slice(-5).map(e => ({ ago_s: Math.round((Date.now() - e.at) / 1000), text: e.text })) }
   }
 }
